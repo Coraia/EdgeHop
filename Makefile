@@ -1,6 +1,6 @@
 # universal_control — Mac mini 触控板/键盘控制 Omarchy 桌面（软件 KVM）
 
-.PHONY: all build build-server build-client bundle icon test clean
+.PHONY: all build build-server build-client bundle omarchy-installer icon test clean
 
 all: build
 
@@ -17,6 +17,10 @@ build-client:
 # macOS 菜单栏应用（.app bundle，免终端）
 bundle:
 	./scripts/bundle-macos.sh
+
+# Omarchy 端一键安装器（脚本 + 双架构客户端）
+omarchy-installer:
+	./scripts/make-omarchy-installer.sh
 
 icon:
 	go run ./tools/genicon

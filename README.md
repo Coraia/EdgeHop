@@ -68,6 +68,21 @@ open dist/universal-control.app
 
 ## Omarchy 端部署（uc-client）
 
+**一键安装**：在 Mac 上执行 `make omarchy-installer` 生成 `dist/omarchy-install.tar.gz`，拷到 Omarchy 后：
+
+```bash
+tar xzf omarchy-install.tar.gz && cd omarchy-install
+./setup-omarchy.sh -s <Mac mini 的IP>        # 自动匹配架构；也可 -b 指定二进制
+```
+
+脚本会自动完成：
+1. `pacman` 安装 `wl-clipboard`、`hyprland-utils`；
+2. 配置 `/dev/uinput` 访问（加入 `input` 组 + udev 规则）；
+3. 安装 `uc-client` 到 `/usr/local/bin`；
+4. 写入 Hyprland 配置：虚拟指针去加速（`input-device`）+ 登录自启（`exec-once`）。
+
+**手动安装**（等价步骤，供排查）：
+
 1. **安装依赖**（Arch）：
 
    ```bash
@@ -99,7 +114,7 @@ open dist/universal-control.app
    ./uc-client-linux-amd64 -server <Mac mini 的IP>:24800
    ```
 
-   开机自启：在 `hyprland.conf` 加 `exec-once = /path/to/uc-client-linux-amd64 -server 192.168.x.x:24800`。
+   开机自启：在 `hyprland.conf` 加 `exec-once = /usr/local/bin/uc-client -server 192.168.x.x:24800`。
 
 5. 参数：
    | 参数 | 默认 | 说明 |
@@ -136,4 +151,6 @@ internal/server/        macOS 实现（CGEventTap、剪贴板、切换引擎、�
 internal/client/        Linux 实现（uinput 注入、wl-clipboard、边缘检测）
 tools/genicon/          菜单栏模板图标生成器
 scripts/bundle-macos.sh .app 打包脚本（LSUIElement + ad-hoc 签名）
+scripts/setup-omarchy.sh Omarchy 一键安装/自启脚本
+scripts/make-omarchy-installer.sh Omarchy 安装器 tar 打包
 ```
