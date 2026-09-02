@@ -1,0 +1,121 @@
+# universal_control
+
+让 **Mac mini 的触控板和键盘控制 Omarchy 台式机**（Linux / Arch + Hyprland / Wayland），并在两台电脑间**双向同步剪贴板**。
+
+配合两台机器共用的 PBP（画中画/双画面）显示器：Mac 在左半屏、Omarchy 在右半屏，鼠标移到屏幕边缘即可"穿越"切换，就像用一台电脑。
+
+```
+┌───────────────┬───────────────┐
+│   Mac mini    │   Omarchy     │  ← 同一台显示器 PBP 分屏
+│  (左半屏)      │  (右半屏)      │
+│  物理键鼠在这边  │  Linux/Arch   │
+└───────┬───────┴───────┬───────┘
+        │  局域网 TCP    │
+  uc-server          uc-client
+  (CGEventTap)       (/dev/uinput + wl-clipboard)
+```
+
+## 工作原理
+
+- **uc-server**（跑在 Mac mini）：通过 macOS `CGEventTap` 全局捕获触控板/键盘事件。
+  - 本地模式：事件正常作用于 Mac；
+  - 光标到达右边缘（或按下热键）→ 进入远程模式，事件被抑制并转发给 Omarchy；
+  - 剪贴板通过 `pbpaste`/`pbcopy` 轮询同步。
+- **uc-client**（跑在 Omarchy）：纯 Go 直写 `/dev/uinput` 注入键鼠事件（免 cgo、免 ydotool 守护进程），用 `wl-copy`/`wl-paste` 同步剪贴板；通过 `hyprctl cursorpos` 检测光标到左边缘，请求切回 Mac。
+- 协议：自研长度前缀二进制帧（鼠标移动/点击/滚轮/键盘/剪贴板/切换），端口默认 `24800`。
+
+## 构建
+
+在 Mac mini 上（本机已装 Go 1.26）：
+
+```bash
+make build          # 产出 bin/uc-server、bin/uc-client-linux-amd64、bin/uc-client-linux-arm64
+```
+
+## Mac mini 端部署（uc-server）
+
+1. 编译后运行：
+
+   ```bash
+   ./bin/uc-server -listen 0.0.0.0:24800 -edge right
+   ```
+
+2. **授予辅助功能（Accessibility）权限**：系统设置 → 隐私与安全性 → 辅助功能，把 `bin/uc-server`（或你用来启动它的终端 App）勾选上。未授权时程序会明确报错并给出提示。
+
+3. 参数：
+   | 参数 | 默认 | 说明 |
+   |---|---|---|
+   | `-listen` | `0.0.0.0:24800` | 监听地址 |
+   | `-edge` | `right` | Omarchy 在 Mac 的哪一侧：`right`/`left` |
+   | `-edge-sensitivity` | `2.0` | 触发切换的边缘像素余量 |
+   | `-switch-keys` | 空 | 手动切换热键的 macOS 键码，逗号分隔，如 `55,56,49`（Cmd+Shift+空格） |
+   | `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
+
+## Omarchy 端部署（uc-client）
+
+1. **安装依赖**（Arch）：
+
+   ```bash
+   sudo pacman -S --needed wl-clipboard hyprland-utils
+   ```
+
+2. **放行 uinput**（一次配置）：
+
+   ```bash
+   sudo usermod -aG input $USER
+   echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/99-universal-control.rules
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   # 重新登录使 input 组生效
+   ```
+
+3. **让虚拟指针平滑**：在 `~/.config/hypr/hyprland.conf` 中加：
+
+   ```ini
+   input-device {
+       name = universal-control
+       accel_profile = flat
+       sensitivity = 0
+   }
+   ```
+
+4. **运行客户端**（必须在 Wayland 会话内，环境变量 `WAYLAND_DISPLAY` 已设置）：
+
+   ```bash
+   ./uc-client-linux-amd64 -server <Mac mini 的IP>:24800
+   ```
+
+   开机自启：在 `hyprland.conf` 加 `exec-once = /path/to/uc-client-linux-amd64 -server 192.168.x.x:24800`。
+
+5. 参数：
+   | 参数 | 默认 | 说明 |
+   |---|---|---|
+   | `-server` | （必填） | Mac mini 地址，如 `192.168.1.10:24800` |
+   | `-device` | `universal-control` | uinput 设备名（与 hyprland.conf 一致） |
+   | `-edge-margin` | `2.0` | 左边缘多少像素内触发切回 Mac |
+   | `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
+   | `-edge-poll` | `40ms` | 光标位置轮询间隔 |
+
+## 使用
+
+- **Mac → Omarchy**：把鼠标移到 Mac 屏幕右边缘；键鼠随即控制 Omarchy。
+- **Omarchy → Mac**：把鼠标移到 Omarchy 屏幕左边缘，控制权切回 Mac。
+- **剪贴板**：任一台上复制文本，另一台可直接粘贴（纯文本，双向）。
+- **热键切换**（可选）：`-switch-keys` 指定组合键可在任意位置手动切换。
+
+## 当前限制（MVP）
+
+- 剪贴板仅同步**纯文本**（图片/富文本暂不支持）。
+- 键码映射覆盖常用键；个别特殊键（如 Fn、多媒体键）可能不生效。
+- 依赖局域网稳定性；有线连接延迟更低。
+- Omarchy 端光标位置的精度受 Wayland 指针加速影响，切回检测通过轮询 `hyprctl cursorpos` 实现，频率可调。
+
+## 目录结构
+
+```
+cmd/uc-server/          macOS 端入口
+cmd/uc-client/          Linux 端入口
+internal/protocol/      网络协议（两端共用，含单测）
+internal/keymap/        macOS 键码 → Linux evdev 键码（含单测）
+internal/server/        macOS 实现（CGEventTap、剪贴板、切换引擎）
+internal/client/        Linux 实现（uinput 注入、wl-clipboard、边缘检测）
+```
