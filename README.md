@@ -34,22 +34,37 @@ make build          # 产出 bin/uc-server、bin/uc-client-linux-amd64、bin/uc-
 
 ## Mac mini 端部署（uc-server）
 
-1. 编译后运行：
+有两种运行方式：
 
-   ```bash
-   ./bin/uc-server -listen 0.0.0.0:24800 -edge right
-   ```
+### 方式 A：菜单栏应用（推荐，免开终端）
 
-2. **授予辅助功能（Accessibility）权限**：系统设置 → 隐私与安全性 → 辅助功能，把 `bin/uc-server`（或你用来启动它的终端 App）勾选上。未授权时程序会明确报错并给出提示。
+```bash
+make bundle        # 生成 dist/universal-control.app
+open dist/universal-control.app
+```
 
-3. 参数：
-   | 参数 | 默认 | 说明 |
-   |---|---|---|
-   | `-listen` | `0.0.0.0:24800` | 监听地址 |
-   | `-edge` | `right` | Omarchy 在 Mac 的哪一侧：`right`/`left` |
-   | `-edge-sensitivity` | `2.0` | 触发切换的边缘像素余量 |
-   | `-switch-keys` | 空 | 手动切换热键的 macOS 键码，逗号分隔，如 `55,56,49`（Cmd+Shift+空格） |
-   | `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
+- 运行后右上角菜单栏出现 Universal Control 图标，服务器同进程自动启动；
+- **授予辅助功能（Accessibility）权限**：系统设置 → 隐私与安全性 → 辅助功能，勾选 `universal-control`（授权后 2 秒内自动生效，无需重启）；
+- 菜单可查看服务器/客户端/模式状态、打开辅助功能设置、打开日志（`~/Library/Logs/universal-control.log`）、勾选"登录时自动启动"（写入 LaunchAgent）、退出；
+- 应用为 `LSUIElement`，不占 Dock。
+
+### 方式 B：命令行（开发/调试用）
+
+```bash
+./bin/uc-server -listen 0.0.0.0:24800 -edge right
+```
+
+同样需要给 `uc-server`（或终端 App）授予辅助功能权限。
+
+### uc-server 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-listen` | `0.0.0.0:24800` | 监听地址 |
+| `-edge` | `right` | Omarchy 在 Mac 的哪一侧：`right`/`left` |
+| `-edge-sensitivity` | `2.0` | 触发切换的边缘像素余量 |
+| `-switch-keys` | 空 | 手动切换热键的 macOS 键码，逗号分隔，如 `55,56,49`（Cmd+Shift+空格） |
+| `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
 
 ## Omarchy 端部署（uc-client）
 
@@ -112,10 +127,13 @@ make build          # 产出 bin/uc-server、bin/uc-client-linux-amd64、bin/uc-
 ## 目录结构
 
 ```
-cmd/uc-server/          macOS 端入口
+cmd/uc-server/          macOS 端入口（命令行）
+cmd/uc-tray/            菜单栏应用入口（systray + 内嵌服务器）
 cmd/uc-client/          Linux 端入口
 internal/protocol/      网络协议（两端共用，含单测）
 internal/keymap/        macOS 键码 → Linux evdev 键码（含单测）
-internal/server/        macOS 实现（CGEventTap、剪贴板、切换引擎）
+internal/server/        macOS 实现（CGEventTap、剪贴板、切换引擎、状态回调）
 internal/client/        Linux 实现（uinput 注入、wl-clipboard、边缘检测）
+tools/genicon/          菜单栏模板图标生成器
+scripts/bundle-macos.sh .app 打包脚本（LSUIElement + ad-hoc 签名）
 ```

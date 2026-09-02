@@ -1,0 +1,206 @@
+// uc-tray is the macOS menu-bar front end for uc-server. It runs the server
+// in-process (so a single Accessibility grant covers everything), shows status
+// in the menu bar, and needs no terminal.
+//
+// Package it as an .app bundle (see `make bundle`): an LSUIElement app that
+// lives only in the menu bar.
+package main
+
+import (
+	_ "embed"
+	"flag"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"text/template"
+	"time"
+
+	"github.com/getlantern/systray"
+	"universal_control/internal/server"
+)
+
+//go:embed assets/menubar.png
+var menuIcon []byte
+
+const (
+	appLabel = "com.universalcontrol.app"
+	tooltip  = "Universal Control — Mac ⇄ Omarchy"
+)
+
+var logPath = filepath.Join(os.Getenv("HOME"), "Library", "Logs", "universal-control.log")
+
+func main() {
+	var (
+		listen  = flag.String("listen", "0.0.0.0:24800", "TCP listen address")
+		edge    = flag.String("edge", "right", "client edge: right or left")
+		connect = flag.String("connect", "", "client address to auto-connect (optional)")
+	)
+	flag.Parse()
+
+	setupLogging()
+
+	systray.Run(func() { onReady(*listen, *edge, *connect) }, onExit)
+}
+
+// onReady runs on the main thread once the tray icon is live.
+func onReady(listen, edge, connect string) {
+	systray.SetTemplateIcon(menuIcon, menuIcon)
+	systray.SetTooltip(tooltip)
+
+	serverItem := systray.AddMenuItem("服务器: 启动中…", "uc-server 运行状态")
+	clientItem := systray.AddMenuItem("客户端: 未连接", "Omarchy 连接状态")
+	modeItem := systray.AddMenuItem("模式: local", "当前控制模式")
+	serverItem.Disable()
+	clientItem.Disable()
+	modeItem.Disable()
+
+	systray.AddSeparator()
+	openAccessItem := systray.AddMenuItem("打开辅助功能设置", "首次使用需在此授权")
+	openLogItem := systray.AddMenuItem("打开日志", "查看运行日志")
+	loginItem := systray.AddMenuItemCheckbox("登录时自动启动", "登录后自动运行本应用", loginItemEnabled())
+
+	systray.AddSeparator()
+	quitItem := systray.AddMenuItem("退出", "退出 Universal Control")
+
+	// Action handlers.
+	go func() {
+		for range openAccessItem.ClickedCh {
+			_ = exec.Command("open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").Start()
+		}
+	}()
+	go func() {
+		for range openLogItem.ClickedCh {
+			_ = exec.Command("open", logPath).Start()
+		}
+	}()
+	go func() {
+		for range loginItem.ClickedCh {
+			on := loginItem.Checked()
+			if on {
+				if err := enableLoginItem(); err != nil {
+					log.Printf("enable login item: %v", err)
+					loginItem.Uncheck()
+				}
+			} else {
+				if err := disableLoginItem(); err != nil {
+					log.Printf("disable login item: %v", err)
+					loginItem.Check()
+				}
+			}
+		}
+	}()
+	go func() {
+		<-quitItem.ClickedCh
+		systray.Quit()
+	}()
+
+	// Start the server engine in-process.
+	cfg := server.DefaultConfig()
+	cfg.ListenAddr = listen
+	cfg.RemoteEdge = edge
+	cfg.ClientAddr = connect
+	go func() {
+		if err := server.RunWithStatus(cfg, func(s server.Status) {
+			updateStatus(serverItem, clientItem, modeItem, s)
+		}); err != nil {
+			log.Printf("server error: %v", err)
+			serverItem.SetTitle("服务器: 启动失败")
+		}
+	}()
+}
+
+func updateStatus(serverItem, clientItem, modeItem *systray.MenuItem, s server.Status) {
+	if s.ServerRunning {
+		serverItem.SetTitle("服务器: 运行中")
+	} else if s.LastError != "" {
+		serverItem.SetTitle("服务器: " + brief(s.LastError))
+	}
+	if s.ClientConnected {
+		clientItem.SetTitle("客户端: 已连接")
+	} else {
+		clientItem.SetTitle("客户端: 未连接")
+	}
+	modeItem.SetTitle("模式: " + s.Mode)
+	if s.LastError != "" {
+		modeItem.SetTooltip(s.LastError)
+	}
+}
+
+func brief(err string) string {
+	if len(err) > 40 {
+		return err[:40] + "…"
+	}
+	return err
+}
+
+// --- logging ---------------------------------------------------------------
+
+func setupLogging() {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		log.Printf("cannot create log dir: %v", err)
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("cannot open log file: %v", err)
+		return
+	}
+	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.Printf("=== Universal Control started %s ===", time.Now().Format(time.RFC3339))
+}
+
+// --- login item (LaunchAgent) ---------------------------------------------
+
+func loginItemPath() string {
+	return filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", appLabel+".plist")
+}
+
+func loginItemEnabled() bool {
+	_, err := os.Stat(loginItemPath())
+	return err == nil
+}
+
+var loginPlistTpl = template.Must(template.New("la").Parse(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>{{.Label}}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{.Binary}}</string>
+	</array>
+	<key>RunAtLoad</key><true/>
+	<key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+`))
+
+func enableLoginItem() error {
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(loginItemPath())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(loginItemPath())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return loginPlistTpl.Execute(f, struct{ Label, Binary string }{appLabel, bin})
+}
+
+func disableLoginItem() error {
+	err := os.Remove(loginItemPath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func onExit() {
+	log.Printf("=== Universal Control exited ===")
+}

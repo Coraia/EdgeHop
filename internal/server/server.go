@@ -10,17 +10,32 @@ import (
 // Run starts the macOS server: the event tap, the engine, and the network
 // accept/dial loop. It blocks until the process is terminated.
 func Run(cfg Config) error {
+	return RunWithStatus(cfg, nil)
+}
+
+// RunWithStatus is like Run but reports state changes through onStatus (used
+// by the menu-bar app). The event tap is retried until it succeeds, so
+// granting Accessibility later takes effect without a restart.
+func RunWithStatus(cfg Config, onStatus func(Status)) error {
 	initDisplay()
 	e := newEngine(cfg)
+	if onStatus != nil {
+		e.setOnStatus(onStatus)
+	}
 
-	// Event tap on a dedicated goroutine (blocks on CFRunLoopRun).
+	// Event tap on a dedicated goroutine with retry (never exits the process).
 	go func() {
-		if err := startEventTap(e.consume); err != nil {
-			log.Fatalf("fatal: %v", err)
+		for {
+			if err := startEventTap(e.consume); err != nil {
+				e.reportError(err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return // startEventTap blocks on CFRunLoopRun until stopped
 		}
 	}()
 
-	// Engine consumes tap events and drives modes/clipboard.
+	// Engine drives modes/clipboard.
 	go e.run()
 
 	// Optionally dial the client (if ClientAddr configured) with reconnects.
@@ -32,6 +47,10 @@ func Run(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	e.updateStatus(func(s *Status) {
+		s.ServerRunning = true
+		s.LastError = ""
+	})
 	log.Printf("uc-server listening on %s (remote edge: %s)", cfg.ListenAddr, cfg.RemoteEdge)
 	log.Printf("grant Accessibility permission if prompted; set remote edge to %q if Omarchy sits on the left", cfg.RemoteEdge)
 
@@ -99,6 +118,7 @@ func (e *engine) handleConn(c net.Conn) {
 
 	log.Printf("client ready: %s (client screen %dx%d)", c.RemoteAddr(), cliW, cliH)
 	e.setConn(cc)
+	e.updateStatus(func(s *Status) { s.ClientConnected = true })
 	e.recvLoop(cc, frameCh)
 
 	e.dropConn(cc)

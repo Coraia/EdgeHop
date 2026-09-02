@@ -52,7 +52,20 @@ type engine struct {
 	lastSet  string // clipboard content last written locally (from client)
 	lastSent string // clipboard content last forwarded to the client
 
+	statusMu sync.Mutex
+	status   Status
+	onStatus func(Status)
+
 	sendQ chan frameOut // buffered frames to client writer
+}
+
+// Status is a snapshot of server state, pushed to the tray/UI via the status
+// callback.
+type Status struct {
+	ServerRunning   bool
+	ClientConnected bool
+	Mode            string // "local" | "remote"
+	LastError       string
 }
 
 type netConn interface {
@@ -111,6 +124,26 @@ func newEngine(cfg Config) *engine {
 // isRemote reports current mode.
 func (e *engine) isRemote() bool { return e.remote.Load() }
 
+// setOnStatus registers a status callback (e.g. the tray app). It is invoked
+// from various goroutines; the callback must be quick and thread-safe.
+func (e *engine) setOnStatus(f func(Status)) {
+	e.statusMu.Lock()
+	e.onStatus = f
+	e.statusMu.Unlock()
+}
+
+// updateStatus mutates the status snapshot and notifies the callback.
+func (e *engine) updateStatus(mut func(*Status)) {
+	e.statusMu.Lock()
+	mut(&e.status)
+	s := e.status
+	f := e.onStatus
+	e.statusMu.Unlock()
+	if f != nil {
+		f(s)
+	}
+}
+
 // setConn installs a new client connection.
 func (e *engine) setConn(c netConn) {
 	e.mu.Lock()
@@ -129,6 +162,7 @@ func (e *engine) dropConn(c netConn) {
 	if gone {
 		// Lost the client: force back to local control.
 		e.switchTo(ModeLocal)
+		e.updateStatus(func(s *Status) { s.ClientConnected = false })
 		log.Printf("control returned to local (client gone)")
 	}
 }
@@ -155,6 +189,13 @@ func (e *engine) switchTo(m Mode) {
 		return
 	}
 	log.Printf("mode: %v -> %v", modeName(old), modeName(m))
+	e.updateStatus(func(s *Status) { s.Mode = modeName(m) })
+}
+
+// reportError records a non-fatal error for the status callback.
+func (e *engine) reportError(err error) {
+	log.Printf("error: %v", err)
+	e.updateStatus(func(s *Status) { s.LastError = err.Error() })
 }
 
 func modeName(m Mode) string {
