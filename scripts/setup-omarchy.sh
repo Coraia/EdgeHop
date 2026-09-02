@@ -39,8 +39,12 @@ if ! command -v pacman >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> 1/4 安装依赖 (wl-clipboard, hyprland-utils)"
-sudo pacman -S --needed --noconfirm wl-clipboard hyprland-utils
+echo "==> 1/4 安装依赖 (wl-clipboard)"
+sudo pacman -S --needed --noconfirm wl-clipboard || { echo "安装 wl-clipboard 失败，请检查网络/源。" >&2; exit 1; }
+# hyprctl 由 hyprland 包提供；hyprland-utils 仅在部分发行版存在，缺失不影响功能
+sudo pacman -S --needed --noconfirm hyprland-utils 2>/dev/null \
+  || echo "    (hyprland-utils 不存在，hyprctl 已随 hyprland 提供，跳过)"
+command -v hyprctl >/dev/null 2>&1 || echo "    (警告: 未找到 hyprctl，边缘切回检测不可用)"
 
 echo "==> 2/4 配置 /dev/uinput 访问权限"
 sudo usermod -aG input "$USER"
@@ -55,14 +59,50 @@ echo "==> 3/4 安装 uc-client 到 /usr/local/bin"
 sudo install -m 755 "$BIN" /usr/local/bin/uc-client
 
 echo "==> 4/4 配置 Hyprland（虚拟指针去加速 + 登录自启）"
-HYPR="$HOME/.config/hypr/hyprland.conf"
-mkdir -p "$(dirname "$HYPR")"
-touch "$HYPR"
-if grep -q "universal-control" "$HYPR"; then
-  echo "    Hyprland 配置已包含 universal-control，跳过写入。"
-  echo "    如需修改服务器地址，请手动编辑 $HYPR 中的 exec-once 行。"
+HYPR_DIR="$HOME/.config/hypr"
+mkdir -p "$HYPR_DIR"
+
+if [ -f "$HYPR_DIR/hyprland.lua" ]; then
+  # --- Omarchy 风格 Lua 配置 ---
+  AUTOSTART="$HYPR_DIR/autostart.lua"
+  if grep -q "universal-control" "$AUTOSTART" 2>/dev/null; then
+    echo "    autostart.lua 已包含 universal-control，跳过。"
+    echo "    如需修改参数，请手动编辑 $AUTOSTART 中的 hl.exec_cmd 行。"
+  else
+    cat >> "$AUTOSTART" <<EOF
+
+-- universal-control: Mac mini 键鼠控制 Omarchy（登录后自启）
+hl.on("hyprland.start", function()
+  hl.exec_cmd("/usr/local/bin/uc-client -server $SERVER:24800 -edge right")
+end)
+EOF
+    echo "    已写入 autostart.lua（登录自启）。"
+  fi
+
+  INPUT="$HYPR_DIR/input.lua"
+  if grep -q "universal-control" "$INPUT" 2>/dev/null; then
+    echo "    input.lua 已包含 universal-control，跳过。"
+  else
+    cat >> "$INPUT" <<EOF
+
+-- universal-control: 虚拟指针去加速（配合 hyprctl eval 可即时生效）
+hl.device({
+  name = "universal-control",
+  accel_profile = "flat",
+  sensitivity = 0,
+})
+EOF
+    echo "    已写入 input.lua（虚拟指针去加速）。"
+  fi
 else
-  cat >> "$HYPR" <<EOF
+  # --- 标准 hyprland.conf（通用 Arch/Hyprland） ---
+  HYPR="$HYPR_DIR/hyprland.conf"
+  touch "$HYPR"
+  if grep -q "universal-control" "$HYPR"; then
+    echo "    hyprland.conf 已包含 universal-control，跳过。"
+    echo "    如需修改服务器地址，请手动编辑 $HYPR 中的 exec-once 行。"
+  else
+    cat >> "$HYPR" <<EOF
 
 # --- universal-control: 虚拟指针去加速 ---
 input-device {
@@ -74,7 +114,8 @@ input-device {
 # --- universal-control: 登录后自启 uc-client ---
 exec-once = /usr/local/bin/uc-client -server $SERVER:24800
 EOF
-  echo "    已写入 input-device 去加速 + exec-once 自启。"
+    echo "    已写入 input-device 去加速 + exec-once 自启。"
+  fi
 fi
 
 echo ""

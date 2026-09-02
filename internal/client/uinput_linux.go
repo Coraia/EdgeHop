@@ -38,12 +38,13 @@ const (
 	keyMax    = 0x2ff
 )
 
-// uinput ioctl numbers.
+// uinput ioctl numbers (linux/uinput.h).
+// NOTE: UI_DEV_SETUP is nr=3 (UI_SET_ABSBIT is nr=103 — easy to mix up).
 const (
 	uiSetEvbit   = 100
 	uiSetKeybit  = 101
 	uiSetRelbit  = 102
-	uiDevSetup   = 103
+	uiDevSetup   = 3
 	uiDevCreate  = 1
 	uiDevDestroy = 2
 )
@@ -69,8 +70,19 @@ type inputID struct {
 	Version uint16
 }
 
-// uinputSetup matches struct uinput_setup (96 bytes on 64-bit).
+// uinputSetup matches the modern struct uinput_setup (92 bytes): name moved
+// before ff_effects_max and ff_effects_max shrank to 32-bit in kernels >= 6.12.
+//   struct { input_id id; char name[80]; __u32 ff_effects_max; }  -> 92 bytes
 type uinputSetup struct {
+	ID           inputID
+	Name         [80]byte
+	FfEffectsMax uint32
+}
+
+// uinputSetupOld matches the pre-6.12 struct uinput_setup (96 bytes):
+//   struct { input_id id; __u64 ff_effects_max; char name[80]; }  -> 96 bytes
+// Only used as an EINVAL fallback for older kernels.
+type uinputSetupOld struct {
 	ID           inputID
 	FfEffectsMax uint64
 	Name         [80]byte
@@ -107,20 +119,20 @@ func OpenVirtualDevice(name string) (*VirtualDevice, error) {
 	}
 
 	for _, ev := range []int{evKey, evRel, evSyn} {
-		if err := setBit(ioc(iocWrite, ioctlTypeU, uiSetEvbit, unsafe.Sizeof(int(0))), ev); err != nil {
+		if err := setBit(ioc(iocWrite, ioctlTypeU, uiSetEvbit, unsafe.Sizeof(int32(0))), ev); err != nil {
 			d.Close()
 			return nil, err
 		}
 	}
 	// Enable every key code so any code from the server is accepted.
 	for k := 0; k <= keyMax; k++ {
-		if err := setBit(ioc(iocWrite, ioctlTypeU, uiSetKeybit, unsafe.Sizeof(int(0))), k); err != nil {
+		if err := setBit(ioc(iocWrite, ioctlTypeU, uiSetKeybit, unsafe.Sizeof(int32(0))), k); err != nil {
 			d.Close()
 			return nil, err
 		}
 	}
 	for _, rel := range []int{relX, relY, relWheel, relHwheel} {
-		if err := setBit(ioc(iocWrite, ioctlTypeU, uiSetRelbit, unsafe.Sizeof(int(0))), rel); err != nil {
+		if err := setBit(ioc(iocWrite, ioctlTypeU, uiSetRelbit, unsafe.Sizeof(int32(0))), rel); err != nil {
 			d.Close()
 			return nil, err
 		}
@@ -136,11 +148,16 @@ func OpenVirtualDevice(name string) (*VirtualDevice, error) {
 	}
 	copy(setup.Name[:], name)
 
-	sz := unsafe.Sizeof(setup)
-	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(),
-		ioc(iocWrite, ioctlTypeU, uiDevSetup, sz), uintptr(unsafe.Pointer(&setup))); e != 0 {
-		d.Close()
-		return nil, e
+	// Modern kernels require UI_DEV_SETUP before UI_DEV_CREATE (the legacy
+	// uinput_user_dev path was removed). If the modern 92-byte layout is
+	// rejected with EINVAL, retry with the pre-6.12 96-byte layout.
+	if err := applySetup(f, unsafe.Pointer(&setup), unsafe.Sizeof(setup)); err != nil {
+		old := uinputSetupOld{ID: setup.ID}
+		copy(old.Name[:], name)
+		if err2 := applySetup(f, unsafe.Pointer(&old), unsafe.Sizeof(old)); err2 != nil {
+			d.Close()
+			return nil, err2
+		}
 	}
 	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(),
 		ioc(0, ioctlTypeU, uiDevCreate, 0), 0); e != 0 {
@@ -148,6 +165,16 @@ func OpenVirtualDevice(name string) (*VirtualDevice, error) {
 		return nil, e
 	}
 	return d, nil
+}
+
+// applySetup issues a UI_DEV_SETUP ioctl with a pointer to the given struct.
+func applySetup(f *os.File, p unsafe.Pointer, sz uintptr) error {
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(),
+		ioc(iocWrite, ioctlTypeU, uiDevSetup, sz), uintptr(p))
+	if e != 0 {
+		return e
+	}
+	return nil
 }
 
 // Close destroys the device.

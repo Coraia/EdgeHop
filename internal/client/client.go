@@ -21,6 +21,8 @@ type Client struct {
 	dev    *VirtualDevice
 	remote atomic.Bool
 
+	scrW, scrH float64 // client screen size (set during handshake)
+
 	mu   sync.Mutex
 	conn net.Conn
 	w    *bufio.Writer
@@ -29,7 +31,7 @@ type Client struct {
 	lastSet  string
 	lastSent string
 
-	stop   chan struct{}
+	stop     chan struct{}
 	stopOnce sync.Once
 }
 
@@ -125,7 +127,15 @@ func (c *Client) runOnce() error {
 	if err := protocol.WriteFrame(c.w, protocol.MsgHello, []byte("universal-control/1")); err != nil {
 		return err
 	}
-	if err := protocol.WriteFrame(c.w, protocol.MsgScreen, protocol.EncodeScreen(0, 0)); err != nil {
+	cw, ch, err := hyprScreenSize()
+	if err != nil {
+		cw, ch = 0, 0
+		log.Printf("warn: screen detection failed: %v", err)
+	}
+	c.mu.Lock()
+	c.scrW, c.scrH = float64(cw), float64(ch)
+	c.mu.Unlock()
+	if err := protocol.WriteFrame(c.w, protocol.MsgScreen, protocol.EncodeScreen(int32(cw), int32(ch))); err != nil {
 		return err
 	}
 	if err := c.w.Flush(); err != nil {
@@ -201,20 +211,20 @@ func (c *Client) handle(f protocol.Frame) {
 	}
 }
 
-// enterRemote starts injecting and watches the left edge for a return.
+// enterRemote starts injecting and watches the shared edge for a return.
 func (c *Client) enterRemote() {
 	if c.remote.Swap(true) {
 		return
 	}
 	log.Printf("remote control: Mac -> Omarchy")
-	// Park the virtual cursor at the left edge (keeping its current Y) so it
-	// lines up with the Mac's right edge in PBP, then begin edge watching.
+	// Park the virtual cursor at the shared edge (keeping its current Y) so it
+	// lines up with the Mac's opposite edge in PBP, then begin edge watching.
 	go func() {
 		_, y, err := hyprCursorPos()
 		if err != nil {
 			return
 		}
-		c.moveCursorAbs(0, y)
+		c.moveCursorAbs(c.sharedEdgeX(), y)
 	}()
 	go c.edgeWatch()
 }
@@ -227,8 +237,16 @@ func (c *Client) leaveRemote() {
 	log.Printf("remote control: returned to Mac")
 }
 
-// edgeWatch polls the cursor and asks the server for control back at the left
-// edge. It self-terminates when remote mode ends.
+// sharedEdgeX returns the X coordinate of the edge shared with the Mac.
+func (c *Client) sharedEdgeX() float64 {
+	if c.cfg.Edge == "left" {
+		return 0
+	}
+	return c.scrW
+}
+
+// edgeWatch polls the cursor and asks the server for control back when the
+// cursor reaches the shared edge. It self-terminates when remote mode ends.
 func (c *Client) edgeWatch() {
 	t := time.NewTicker(c.cfg.EdgePollInterval)
 	defer t.Stop()
@@ -240,7 +258,11 @@ func (c *Client) edgeWatch() {
 		if err != nil {
 			continue
 		}
-		if x <= c.cfg.EdgeMargin {
+		atEdge := x <= c.cfg.EdgeMargin
+		if c.cfg.Edge == "right" {
+			atEdge = x >= c.scrW-c.cfg.EdgeMargin
+		}
+		if atEdge {
 			c.send(protocol.MsgSwitch, []byte("back"))
 			c.leaveRemote()
 			return

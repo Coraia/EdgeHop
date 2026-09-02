@@ -2,26 +2,26 @@
 
 让 **Mac mini 的触控板和键盘控制 Omarchy 台式机**（Linux / Arch + Hyprland / Wayland），并在两台电脑间**双向同步剪贴板**。
 
-配合两台机器共用的 PBP（画中画/双画面）显示器：Mac 在左半屏、Omarchy 在右半屏，鼠标移到屏幕边缘即可"穿越"切换，就像用一台电脑。
+配合两台机器共用的 PBP（画中画/双画面）显示器：**Omarchy 在左半屏、Mac mini 在右半屏**，鼠标移到两台屏幕之间的边缘即可"穿越"切换，就像用一台电脑。
 
 ```
 ┌───────────────┬───────────────┐
-│   Mac mini    │   Omarchy     │  ← 同一台显示器 PBP 分屏
+│    Omarchy    │   Mac mini    │  ← 同一台显示器 PBP 分屏
 │  (左半屏)      │  (右半屏)      │
-│  物理键鼠在这边  │  Linux/Arch   │
+│  Linux/Arch   │  物理键鼠在这边  │
 └───────┬───────┴───────┬───────┘
         │  局域网 TCP    │
-  uc-server          uc-client
-  (CGEventTap)       (/dev/uinput + wl-clipboard)
+  uc-client          uc-server
+  (/dev/uinput + wl-clipboard)   (CGEventTap)
 ```
 
 ## 工作原理
 
 - **uc-server**（跑在 Mac mini）：通过 macOS `CGEventTap` 全局捕获触控板/键盘事件。
   - 本地模式：事件正常作用于 Mac；
-  - 光标到达右边缘（或按下热键）→ 进入远程模式，事件被抑制并转发给 Omarchy；
+  - 光标到达 Mac **左边缘**（Omarchy 在 Mac 左侧）或按下热键 → 进入远程模式，事件被抑制并转发给 Omarchy；
   - 剪贴板通过 `pbpaste`/`pbcopy` 轮询同步。
-- **uc-client**（跑在 Omarchy）：纯 Go 直写 `/dev/uinput` 注入键鼠事件（免 cgo、免 ydotool 守护进程），用 `wl-copy`/`wl-paste` 同步剪贴板；通过 `hyprctl cursorpos` 检测光标到左边缘，请求切回 Mac。
+- **uc-client**（跑在 Omarchy）：纯 Go 直写 `/dev/uinput` 注入键鼠事件（免 cgo、免 ydotool 守护进程），用 `wl-copy`/`wl-paste` 同步剪贴板；通过 `hyprctl cursorpos` 检测光标到 Omarchy **右边缘**，请求切回 Mac。
 - 协议：自研长度前缀二进制帧（鼠标移动/点击/滚轮/键盘/剪贴板/切换），端口默认 `24800`。
 
 ## 构建
@@ -47,11 +47,18 @@ open dist/universal-control.app
 - **授予辅助功能（Accessibility）权限**：系统设置 → 隐私与安全性 → 辅助功能，勾选 `universal-control`（授权后 2 秒内自动生效，无需重启）；
 - 菜单可查看服务器/客户端/模式状态、打开辅助功能设置、打开日志（`~/Library/Logs/universal-control.log`）、勾选"登录时自动启动"（写入 LaunchAgent）、退出；
 - 应用为 `LSUIElement`，不占 Dock。
+- **边缘方向配置**（免终端）：写入 `~/Library/Application Support/universal-control/config.json`，例如本仓库默认布局（Omarchy 在左）为：
+
+  ```json
+  {"edge": "left"}
+  ```
+
+  命令行参数优先于配置文件。
 
 ### 方式 B：命令行（开发/调试用）
 
 ```bash
-./bin/uc-server -listen 0.0.0.0:24800 -edge right
+./bin/uc-server -listen 0.0.0.0:24800 -edge left
 ```
 
 同样需要给 `uc-server`（或终端 App）授予辅助功能权限。

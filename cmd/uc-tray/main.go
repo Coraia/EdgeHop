@@ -8,6 +8,7 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
@@ -31,17 +32,58 @@ const (
 
 var logPath = filepath.Join(os.Getenv("HOME"), "Library", "Logs", "universal-control.log")
 
+// configFilePath is an optional JSON config that overrides defaults so the app
+// can be configured without launching from a terminal. Fields: listen, edge,
+// connect.
+func configFilePath() string {
+	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support",
+		"universal-control", "config.json")
+}
+
+type fileConfig struct {
+	Listen  string `json:"listen"`
+	Edge    string `json:"edge"`
+	Connect string `json:"connect"`
+}
+
 func main() {
 	var (
 		listen  = flag.String("listen", "0.0.0.0:24800", "TCP listen address")
 		edge    = flag.String("edge", "right", "client edge: right or left")
 		connect = flag.String("connect", "", "client address to auto-connect (optional)")
 	)
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	flag.Parse()
+
+	// Apply optional config file for flags not given on the command line.
+	if fc, err := readFileConfig(); err == nil {
+		if !set["listen"] && fc.Listen != "" {
+			*listen = fc.Listen
+		}
+		if !set["edge"] && (fc.Edge == "left" || fc.Edge == "right") {
+			*edge = fc.Edge
+		}
+		if !set["connect"] && fc.Connect != "" {
+			*connect = fc.Connect
+		}
+	}
 
 	setupLogging()
 
 	systray.Run(func() { onReady(*listen, *edge, *connect) }, onExit)
+}
+
+func readFileConfig() (*fileConfig, error) {
+	b, err := os.ReadFile(configFilePath())
+	if err != nil {
+		return nil, err
+	}
+	var fc fileConfig
+	if err := json.Unmarshal(b, &fc); err != nil {
+		return nil, err
+	}
+	return &fc, nil
 }
 
 // onReady runs on the main thread once the tray icon is live.
