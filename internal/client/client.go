@@ -260,14 +260,20 @@ func (c *Client) sharedEdgeX() float64 {
 }
 
 // edgeWatch polls the cursor and asks the server for control back when the
-// cursor reaches the shared edge. It self-terminates when remote mode ends.
+// cursor dwells at the shared edge. It self-terminates when remote mode ends.
+//
+// A dwell is required (not a single poll) so that simply passing through the
+// edge zone — e.g. the cursor being parked near the edge when remote control
+// starts — does not bounce control back immediately.
 func (c *Client) edgeWatch() {
 	// Give enterRemote's parking a moment to move the cursor inside the shared
 	// edge, so a cursor already sitting at the edge (e.g. from the previous
 	// remote session) does not immediately bounce control back.
 	time.Sleep(300 * time.Millisecond)
+	const dwell = 400 * time.Millisecond
 	t := time.NewTicker(c.cfg.EdgePollInterval)
 	defer t.Stop()
+	var inZoneSince time.Time
 	for range t.C {
 		if !c.remote.Load() || !c.connected() {
 			return
@@ -281,10 +287,18 @@ func (c *Client) edgeWatch() {
 			atEdge = x >= c.scrW-c.cfg.EdgeMargin
 		}
 		if atEdge {
-			log.Printf("edge hit: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, c.scrW, c.cfg.EdgeMargin, c.cfg.Edge)
-			c.send(protocol.MsgSwitch, []byte("back"))
-			c.leaveRemote()
-			return
+			if inZoneSince.IsZero() {
+				inZoneSince = time.Now()
+				continue
+			}
+			if time.Since(inZoneSince) >= dwell {
+				log.Printf("edge dwell: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, c.scrW, c.cfg.EdgeMargin, c.cfg.Edge)
+				c.send(protocol.MsgSwitch, []byte("back"))
+				c.leaveRemote()
+				return
+			}
+		} else {
+			inZoneSince = time.Time{}
 		}
 	}
 }

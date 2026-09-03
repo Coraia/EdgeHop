@@ -3,10 +3,13 @@
 package server
 
 /*
-#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation
+#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation -framework AppKit
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <dlfcn.h>
 #include <stdint.h>
 
 // onEventGo is implemented in Go (see below). It returns 0 to consume the
@@ -66,9 +69,12 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
     return event;
 }
 
-// createTapAndRun creates the session-level event tap and blocks on the
-// current thread's run loop. Returns -1 if the tap cannot be created
-// (usually: Accessibility permission not granted).
+// createTapAndRun creates the HID-level event tap and blocks on the
+// current thread's run loop. HID level is used so that consuming an event
+// prevents the cursor from moving / the key from reaching apps (session level
+// sees events only after the window server has already applied them, so the
+// Mac cursor would keep tracking the touchpad during remote control).
+// Returns -1 if the tap cannot be created (Accessibility permission missing).
 static int createTapAndRun(void) {
     CGEventMask mask = 0;
     mask |= CGEventMaskBit(kCGEventKeyDown);
@@ -86,7 +92,7 @@ static int createTapAndRun(void) {
     mask |= CGEventMaskBit(kCGEventOtherMouseUp);
     mask |= CGEventMaskBit(kCGEventScrollWheel);
 
-    CFMachPortRef tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+    CFMachPortRef tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap,
                                          kCGEventTapOptionDefault, mask,
                                          tapCallback, NULL);
     if (tap == NULL) {
@@ -129,17 +135,98 @@ static void warpMouse(double x, double y) {
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
 }
-static void hideCursor(void) {
+// warpOffscreen moves the cursor to a point outside the visible screen so it
+// cannot be seen while remote control is active. CGWarpMouseCursorPosition
+// sets the position directly (no HID event is posted).
+static void warpOffscreen(double x, double y) {
+    CGWarpMouseCursorPosition(CGPointMake(x, y));
+}
+// setMouseAssociatation disassociates/associates the physical mouse from the
+// cursor position. While disassociated, moving the mouse does NOT move the
+// cursor at all (the OS guarantees it, regardless of event tap level), which
+// is exactly what remote mode needs so the Mac cursor never tracks the
+// touchpad. Input events are still delivered to taps while disassociated.
+// NOTE: this API only takes effect while the calling application is in the
+// FOREGROUND, so it is ineffective for a background menu-bar app. It is kept
+// here as a harmless best-effort; cursor hiding is what actually works.
+static void setMouseAssociation(int associated) {
+    CGAssociateMouseAndMouseCursorPosition(associated ? true : false);
+}
+
+// Cursor control (background process):
+// macOS only honors cursor show/hide requests from the frontmost application.
+// A menu-bar (accessory) app is never frontmost, so NSCursor.hide() and
+// CGDisplayHideCursor() are normally ignored. To let this background app hide
+// the cursor while the user is controlling the remote machine, we opt into
+// background cursor control via the private CoreGraphics SPI
+// CGSMainConnectionID + CGSSetConnectionProperty("SetsCursorInBackground"),
+// resolved at runtime with dlsym (stable across many macOS releases, used by
+// popular cursor utilities).
+
+typedef int32_t (*UCMainConnectionIDFn)(void);
+typedef int32_t (*UCSetConnectionPropertyFn)(int32_t, int32_t, CFStringRef, CFTypeRef);
+
+// enableBackgroundCursorControl returns 0 on success.
+static int enableBackgroundCursorControl(void) {
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW);
+    if (cg == NULL) {
+        return -1;
+    }
+    UCMainConnectionIDFn mainConn = (UCMainConnectionIDFn)dlsym(cg, "CGSMainConnectionID");
+    UCSetConnectionPropertyFn setProp =
+        (UCSetConnectionPropertyFn)dlsym(cg, "CGSSetConnectionProperty");
+    if (mainConn == NULL || setProp == NULL) {
+        return -2;
+    }
+    int32_t conn = mainConn();
+    int32_t status = setProp(conn, conn, CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
+    return status;
+}
+
+// hideCursor / showCursor via AppKit NSCursor (persistent until unhide).
+static void hideCursorNSCursor(void) {
+    id cls = (id)objc_getClass("NSCursor");
+    if (cls != NULL) {
+        ((void (*)(id, SEL))objc_msgSend)(cls, sel_registerName("hide"));
+    }
+    // Belt and suspenders: also try the CoreGraphics hide (refcounted too).
     CGDisplayHideCursor(kCGDirectMainDisplay);
 }
-static void showCursor(void) {
+static void showCursorNSCursor(void) {
+    id cls = (id)objc_getClass("NSCursor");
+    if (cls != NULL) {
+        ((void (*)(id, SEL))objc_msgSend)(cls, sel_registerName("unhide"));
+    }
     CGDisplayShowCursor(kCGDirectMainDisplay);
+}
+static void hideCursor(void) {
+    hideCursorNSCursor();
+}
+static void showCursor(void) {
+    showCursorNSCursor();
+}
+
+// cursorVisible reports the global cursor visibility via the private
+// CGCursorIsVisible symbol (marked unavailable in the SDK but present at
+// runtime). Returns -1 if the symbol cannot be resolved.
+static int cursorVisible(void) {
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW);
+    if (cg == NULL) {
+        return -1;
+    }
+    typedef int32_t (*CursorIsVisibleFn)(void);
+    CursorIsVisibleFn fn = (CursorIsVisibleFn)dlsym(cg, "CGCursorIsVisible");
+    if (fn == NULL) {
+        return -1;
+    }
+    return fn() != 0 ? 1 : 0;
 }
 */
 import "C"
 
 import (
 	"errors"
+	"log"
 )
 
 // onEventGo is called from the C event tap callback. It returns 0 to consume
@@ -191,6 +278,23 @@ func initDisplay() {
 	warpMouse = func(x, y float64) {
 		C.warpMouse(C.double(x), C.double(y))
 	}
+	warpOffscreen = func(x, y float64) {
+		C.warpOffscreen(C.double(x), C.double(y))
+	}
+	setMouseAssoc = func(assoc bool) {
+		C.setMouseAssociation(0)
+		if assoc {
+			C.setMouseAssociation(1)
+		}
+	}
 	hideCursor = func() { C.hideCursor() }
 	showCursor = func() { C.showCursor() }
+	cursorVisible = func() int { return int(C.cursorVisible()) }
+	// Opt into background cursor control so hideCursor() actually takes effect
+	// while this menu-bar app is not the frontmost process.
+	if rc := C.enableBackgroundCursorControl(); rc != 0 {
+		log.Printf("warning: SetsCursorInBackground SPI failed (%d); cursor hiding may not work", int(rc))
+	} else {
+		log.Printf("background cursor control enabled (SetsCursorInBackground)")
+	}
 }

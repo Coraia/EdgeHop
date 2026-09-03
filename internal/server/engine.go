@@ -48,6 +48,11 @@ type engine struct {
 	swKeys   map[int]bool // hotkey codes for manual toggle
 	keysDown map[int]bool // mac keycodes currently down
 
+	// edgeArmed gates edge re-entry after returning to local: the cursor must
+	// first move away from the shared edge before an edge crossing will switch
+	// to remote again. Prevents the "warp to edge -> immediate re-enter" loop.
+	edgeArmed bool
+
 	clpMu    sync.Mutex
 	lastSet  string // clipboard content last written locally (from client)
 	lastSent string // clipboard content last forwarded to the client
@@ -108,6 +113,20 @@ var warpMouse func(x, y float64)
 var hideCursor func()
 var showCursor func()
 
+// cursorVisible returns 1 if the system cursor is visible, 0 if hidden, -1 if
+// unknown. Used for diagnostics only (best-effort).
+var cursorVisible func() int
+
+// warpOffscreen moves the local cursor outside the visible screen (used while
+// remote is active so the Mac cursor is never visible even if the hide API is
+// unavailable). Overridable in tests.
+var warpOffscreen func(x, y float64)
+
+// setMouseAssoc disassociates (false) or re-associates (true) the physical
+// mouse with the cursor position. While disassociated the cursor never tracks
+// the mouse, no matter the event tap level. Overridable in tests.
+var setMouseAssoc func(assoc bool)
+
 // remoteEdgeIsRight reports whether the client sits on the Mac's right edge.
 func (e *engine) remoteEdgeIsRight() bool {
 	return e.cfg.RemoteEdge == EdgeRight
@@ -125,6 +144,7 @@ func newEngine(cfg Config) *engine {
 		e.swKeys[k] = true
 	}
 	e.remote.Store(false)
+	e.edgeArmed = true // initial state: first edge crossing may enter remote
 	return e
 }
 
@@ -261,8 +281,15 @@ func (e *engine) watchLocal(ev rawEvent) bool {
 	if ev.ctype == cgEventMouseMoved || ev.ctype == cgEventLeftMouseDragged ||
 		ev.ctype == cgEventRightMouseDragged || ev.ctype == cgEventOtherMouseDragged {
 		if x, _ := mousePos(); e.atRemoteEdge(x) {
-			e.enterRemote()
-			return true
+			if e.edgeArmed {
+				e.enterRemote()
+				return true
+			}
+		} else {
+			// Cursor moved away from the shared edge: arm it so a later
+			// crossing can re-enter remote (prevents immediate re-entry after
+			// returning to local with the cursor warped onto the edge).
+			e.edgeArmed = true
 		}
 	}
 
@@ -336,12 +363,26 @@ func (e *engine) enterRemote() {
 	}
 	e.switchTo(ModeRemote)
 	e.send(protocol.MsgSwitch, []byte("remote"))
+	// Stop the physical mouse from driving the Mac cursor and hide it.
+	if setMouseAssoc != nil {
+		setMouseAssoc(false)
+	}
 	if hideCursor != nil {
 		hideCursor()
 	}
-	if e.remoteEdgeIsRight() {
+	// Park the Mac cursor off-screen (clamped to the edge on macOS, which is
+	// fine — it will not track the touchpad while disassociated).
+	if warpOffscreen != nil {
 		_, y := mousePos()
-		warpMouse(e.scrWf()-1, clampY(y))
+		if e.remoteEdgeIsRight() {
+			warpOffscreen(e.scrWf()+1000, clampY(y))
+		} else {
+			warpOffscreen(-1000, clampY(y))
+		}
+	}
+	log.Printf("remote control active (mouse disassociated, cursor hidden)")
+	if cursorVisible != nil {
+		log.Printf("cursor visibility after hide: %d (1=visible 0=hidden -1=unknown)", cursorVisible())
 	}
 }
 
@@ -352,6 +393,11 @@ func (e *engine) leaveRemote() {
 	}
 	e.switchTo(ModeLocal)
 	e.send(protocol.MsgSwitch, []byte("back"))
+	e.edgeArmed = false // cursor will be warped onto the edge; require it to leave first
+	// Re-associate the mouse with the cursor and show it again.
+	if setMouseAssoc != nil {
+		setMouseAssoc(true)
+	}
 	if showCursor != nil {
 		showCursor()
 	}
