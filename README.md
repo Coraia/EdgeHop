@@ -54,6 +54,7 @@ open dist/universal-control.app
   ```
 
   命令行参数优先于配置文件。
+- **默认切换热键 ⌘⇧空格**：在任意一侧按下即切换控制权（Mac↔Omarchy），即使边缘检测未触发也能切回；可在 config.json 用 `"switchKeys": [55,56,49]` 覆盖（macOS 键码）。
 
 ### 方式 B：命令行（开发/调试用）
 
@@ -128,16 +129,19 @@ tar xzf omarchy-install.tar.gz && cd omarchy-install
    |---|---|---|
    | `-server` | （必填） | Mac mini 地址，如 `192.168.1.10:24800` |
    | `-device` | `universal-control` | uinput 设备名（与 hyprland.conf 一致） |
-   | `-edge-margin` | `2.0` | 左边缘多少像素内触发切回 Mac |
+   | `-edge` | `right` | Omarchy 的哪一侧对着 Mac：`right`（Omarchy 在左）、`left`（Omarchy 在右） |
+   | `-edge-margin` | `8` | 边缘多少像素内触发切回 Mac（逻辑像素） |
    | `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
    | `-edge-poll` | `40ms` | 光标位置轮询间隔 |
 
+   注意：Omarchy 的 `hyprctl cursorpos` 返回**逻辑坐标**（受显示器 scale 影响，如 1.25x 时 1920 物理宽 → 逻辑宽 1536）。客户端已按逻辑尺寸计算边缘，无需手动换算。
+
 ## 使用
 
-- **Mac → Omarchy**：把鼠标移到 Mac 屏幕右边缘；键鼠随即控制 Omarchy。
-- **Omarchy → Mac**：把鼠标移到 Omarchy 屏幕左边缘，控制权切回 Mac。
+- **Mac → Omarchy**：把鼠标移到 Mac 屏幕**左边缘**（Omarchy 在 Mac 左侧时）；键鼠随即控制 Omarchy，Mac 光标自动隐藏。
+- **Omarchy → Mac**：把鼠标移到 Omarchy 屏幕**右边缘**，控制权切回 Mac。
+- **热键切换**：按 **⌘⇧空格** 可在任意一侧、任意位置手动切换（默认开启）。
 - **剪贴板**：任一台上复制文本，另一台可直接粘贴（纯文本，双向）。
-- **热键切换**（可选）：`-switch-keys` 指定组合键可在任意位置手动切换。
 
 ## 当前限制（MVP）
 

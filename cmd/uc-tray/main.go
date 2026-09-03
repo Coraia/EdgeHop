@@ -41,10 +41,16 @@ func configFilePath() string {
 }
 
 type fileConfig struct {
-	Listen  string `json:"listen"`
-	Edge    string `json:"edge"`
-	Connect string `json:"connect"`
+	Listen     string `json:"listen"`
+	Edge       string `json:"edge"`
+	Connect    string `json:"connect"`
+	SwitchKeys []int  `json:"switchKeys"` // macOS keycodes to hold together to toggle remote (nil/empty = default Cmd+Shift+Space)
 }
+
+// defaultSwitchKeys is the built-in hotkey (⌘⇧Space) used to toggle remote
+// control when none is configured, so there is always a reliable way back to
+// the Mac even if edge detection does not fire.
+var defaultSwitchKeys = []int{55, 56, 49} // Command, Shift, Space
 
 func main() {
 	var (
@@ -57,6 +63,7 @@ func main() {
 	flag.Parse()
 
 	// Apply optional config file for flags not given on the command line.
+	switchKeys := defaultSwitchKeys
 	if fc, err := readFileConfig(); err == nil {
 		if !set["listen"] && fc.Listen != "" {
 			*listen = fc.Listen
@@ -67,11 +74,14 @@ func main() {
 		if !set["connect"] && fc.Connect != "" {
 			*connect = fc.Connect
 		}
+		if len(fc.SwitchKeys) > 0 {
+			switchKeys = fc.SwitchKeys
+		}
 	}
 
 	setupLogging()
 
-	systray.Run(func() { onReady(*listen, *edge, *connect) }, onExit)
+	systray.Run(func() { onReady(*listen, *edge, *connect, switchKeys) }, onExit)
 }
 
 func readFileConfig() (*fileConfig, error) {
@@ -87,7 +97,7 @@ func readFileConfig() (*fileConfig, error) {
 }
 
 // onReady runs on the main thread once the tray icon is live.
-func onReady(listen, edge, connect string) {
+func onReady(listen, edge, connect string, switchKeys []int) {
 	systray.SetTemplateIcon(menuIcon, menuIcon)
 	systray.SetTooltip(tooltip)
 
@@ -143,6 +153,7 @@ func onReady(listen, edge, connect string) {
 	cfg.ListenAddr = listen
 	cfg.RemoteEdge = edge
 	cfg.ClientAddr = connect
+	cfg.SwitchKeys = switchKeys
 	go func() {
 		if err := server.RunWithStatus(cfg, func(s server.Status) {
 			updateStatus(serverItem, clientItem, modeItem, s)

@@ -33,7 +33,7 @@ func DefaultConfig() Config {
 	return Config{
 		DeviceName:       "universal-control",
 		Edge:             "right",
-		EdgeMargin:       2.0,
+		EdgeMargin:       8.0,
 		ClipInterval:     500 * time.Millisecond,
 		EdgePollInterval: 40 * time.Millisecond,
 	}

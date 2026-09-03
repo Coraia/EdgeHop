@@ -119,6 +119,13 @@ func (e *engine) handleConn(c net.Conn) {
 	log.Printf("client ready: %s (client screen %dx%d)", c.RemoteAddr(), cliW, cliH)
 	e.setConn(cc)
 	e.updateStatus(func(s *Status) { s.ClientConnected = true })
+	// Re-sync control mode to the new client: if we are already in remote mode
+	// (e.g. the client reconnected while we were controlling Omarchy), tell it
+	// so its edge-watch / input path starts correctly.
+	if e.isRemote() {
+		_ = cc.Send(protocol.MsgSwitch, []byte("remote"))
+		log.Printf("re-synced remote mode to reconnected client")
+	}
 	e.recvLoop(cc, frameCh)
 
 	e.dropConn(cc)

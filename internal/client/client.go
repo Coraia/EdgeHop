@@ -217,16 +217,30 @@ func (c *Client) enterRemote() {
 		return
 	}
 	log.Printf("remote control: Mac -> Omarchy")
-	// Park the virtual cursor at the shared edge (keeping its current Y) so it
-	// lines up with the Mac's opposite edge in PBP, then begin edge watching.
+	// Park the virtual cursor just inside the shared edge (keeping its current
+	// Y) so it lines up with the Mac's opposite edge in PBP without sitting
+	// exactly on the return threshold, then begin edge watching.
 	go func() {
-		_, y, err := hyprCursorPos()
+		x, y, err := hyprCursorPos()
 		if err != nil {
+			log.Printf("warn: park: cursorpos failed: %v", err)
 			return
 		}
-		c.moveCursorAbs(c.sharedEdgeX(), y)
+		c.moveCursorAbs(c.parkX(), y)
+		log.Printf("parked cursor at x=%.0f (was %.0f)", c.parkX(), x)
 	}()
 	go c.edgeWatch()
+}
+
+// parkX returns the X coordinate to park the virtual cursor at when entering
+// remote: just inside the shared edge so the cursor stays visible and near the
+// PBP boundary without tripping the return detector.
+func (c *Client) parkX() float64 {
+	const inset = 24.0
+	if c.cfg.Edge == "left" {
+		return inset
+	}
+	return c.scrW - inset
 }
 
 // leaveRemote stops edge watching.
@@ -248,6 +262,10 @@ func (c *Client) sharedEdgeX() float64 {
 // edgeWatch polls the cursor and asks the server for control back when the
 // cursor reaches the shared edge. It self-terminates when remote mode ends.
 func (c *Client) edgeWatch() {
+	// Give enterRemote's parking a moment to move the cursor inside the shared
+	// edge, so a cursor already sitting at the edge (e.g. from the previous
+	// remote session) does not immediately bounce control back.
+	time.Sleep(300 * time.Millisecond)
 	t := time.NewTicker(c.cfg.EdgePollInterval)
 	defer t.Stop()
 	for range t.C {
@@ -263,6 +281,7 @@ func (c *Client) edgeWatch() {
 			atEdge = x >= c.scrW-c.cfg.EdgeMargin
 		}
 		if atEdge {
+			log.Printf("edge hit: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, c.scrW, c.cfg.EdgeMargin, c.cfg.Edge)
 			c.send(protocol.MsgSwitch, []byte("back"))
 			c.leaveRemote()
 			return

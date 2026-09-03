@@ -101,6 +101,13 @@ var mousePos func() (x, y float64)
 // warpMouse moves the cursor. Overridable in tests.
 var warpMouse func(x, y float64)
 
+// hideCursor / showCursor hide and show the local (Mac) cursor. While in
+// remote mode the Mac cursor is hidden so it does not keep visibly tracking
+// the touchpad (it would otherwise leave a confusing "trail" on the Mac screen
+// while control is on Omarchy). Overridable in tests.
+var hideCursor func()
+var showCursor func()
+
 // remoteEdgeIsRight reports whether the client sits on the Mac's right edge.
 func (e *engine) remoteEdgeIsRight() bool {
 	return e.cfg.RemoteEdge == EdgeRight
@@ -162,6 +169,9 @@ func (e *engine) dropConn(c netConn) {
 	if gone {
 		// Lost the client: force back to local control.
 		e.switchTo(ModeLocal)
+		if showCursor != nil {
+			showCursor()
+		}
 		e.updateStatus(func(s *Status) { s.ClientConnected = false })
 		log.Printf("control returned to local (client gone)")
 	}
@@ -326,6 +336,9 @@ func (e *engine) enterRemote() {
 	}
 	e.switchTo(ModeRemote)
 	e.send(protocol.MsgSwitch, []byte("remote"))
+	if hideCursor != nil {
+		hideCursor()
+	}
 	if e.remoteEdgeIsRight() {
 		_, y := mousePos()
 		warpMouse(e.scrWf()-1, clampY(y))
@@ -339,6 +352,9 @@ func (e *engine) leaveRemote() {
 	}
 	e.switchTo(ModeLocal)
 	e.send(protocol.MsgSwitch, []byte("back"))
+	if showCursor != nil {
+		showCursor()
+	}
 	_, y := mousePos()
 	if e.remoteEdgeIsRight() {
 		warpMouse(e.scrWf()-1, clampY(y))

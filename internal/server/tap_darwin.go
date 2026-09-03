@@ -129,6 +129,12 @@ static void warpMouse(double x, double y) {
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
 }
+static void hideCursor(void) {
+    CGDisplayHideCursor(kCGDirectMainDisplay);
+}
+static void showCursor(void) {
+    CGDisplayShowCursor(kCGDirectMainDisplay);
+}
 */
 import "C"
 
@@ -185,4 +191,6 @@ func initDisplay() {
 	warpMouse = func(x, y float64) {
 		C.warpMouse(C.double(x), C.double(y))
 	}
+	hideCursor = func() { C.hideCursor() }
+	showCursor = func() { C.showCursor() }
 }
