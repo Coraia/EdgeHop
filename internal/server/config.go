@@ -23,8 +23,23 @@ type Config struct {
 	SwitchKeys []int
 
 	// EdgeSensitivity is the margin (in points) from the screen edge that
-	// triggers a switch. Larger values make switching easier.
+	// triggers the sticky state. Larger values make the light bar appear
+	// earlier and give the cursor more room to "stick".
 	EdgeSensitivity float64
+
+	// StickyDwellMin is the dwell required to break free when the cursor is
+	// pressed hard against the seam (closeness = 1).
+	StickyDwellMin time.Duration
+
+	// StickyDwellMax is the dwell required when the cursor only just entered
+	// the sticky zone (closeness = 0). Dwell interpolates between these two
+	// values as the cursor approaches the edge, so a light touch needs longer
+	// before switching (anti-accidental) and a firm press switches sooner.
+	StickyDwellMax time.Duration
+
+	// StickyPush is the outward distance (points) the user must push past the
+	// edge to break free immediately (instead of waiting for the dwell).
+	StickyPush float64
 
 	// ClipboardPollInterval is how often the server polls the macOS
 	// clipboard for changes.
@@ -36,7 +51,10 @@ func DefaultConfig() Config {
 	return Config{
 		ListenAddr:           "0.0.0.0:24800",
 		RemoteEdge:           "right",
-		EdgeSensitivity:      2.0,
+		EdgeSensitivity:      8.0,
+		StickyDwellMin:       300 * time.Millisecond,
+		StickyDwellMax:       1 * time.Second,
+		StickyPush:           4.0,
 		ClipboardPollInterval: 500 * time.Millisecond,
 	}
 }

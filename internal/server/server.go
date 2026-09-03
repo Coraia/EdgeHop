@@ -19,6 +19,7 @@ func Run(cfg Config) error {
 func RunWithStatus(cfg Config, onStatus func(Status)) error {
 	initDisplay()
 	e := newEngine(cfg)
+	e.onEdgeUI = func(on bool, barLen float64) { setStickyOverlay(on, barLen) }
 	if onStatus != nil {
 		e.setOnStatus(onStatus)
 	}

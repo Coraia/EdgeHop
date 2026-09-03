@@ -18,6 +18,10 @@ extern int onEventGo(int type, int64_t keycode, int64_t flags,
                      double dx, double dy, int64_t button,
                      int64_t scrollAxis1, int64_t scrollAxis2);
 
+// Sticky-edge overlay (overlay_darwin.m).
+void uc_overlay_set_sticky(int on, double cx, double cy, double barLen);
+void uc_overlay_teardown(void);
+
 static CFMachPortRef g_tap = NULL;
 
 static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
@@ -297,4 +301,17 @@ func initDisplay() {
 	} else {
 		log.Printf("background cursor control enabled (SetsCursorInBackground)")
 	}
+}
+
+// setStickyOverlay shows or hides the sticky-edge light bar at the current
+// cursor position. barLen is the current bar height in points. It is safe to
+// call from any goroutine; the ObjC overlay dispatches the actual AppKit work
+// to the main queue.
+func setStickyOverlay(on bool, barLen float64) {
+	x, y := mousePos()
+	onI := 0
+	if on {
+		onI = 1
+	}
+	C.uc_overlay_set_sticky(C.int(onI), C.double(x), C.double(y), C.double(barLen))
 }

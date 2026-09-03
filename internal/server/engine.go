@@ -1,9 +1,13 @@
 package server
 
 import (
+	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"universal_control/internal/protocol"
 )
 
@@ -48,10 +52,27 @@ type engine struct {
 	swKeys   map[int]bool // hotkey codes for manual toggle
 	keysDown map[int]bool // mac keycodes currently down
 
+	// hotkeyLocked prevents the switch-hotkey from firing again until all of
+	// its keys are released (see hotkeyDown).
+	hotkeyLocked bool
+
 	// edgeArmed gates edge re-entry after returning to local: the cursor must
 	// first move away from the shared edge before an edge crossing will switch
 	// to remote again. Prevents the "warp to edge -> immediate re-enter" loop.
 	edgeArmed bool
+
+	// sticky tracks the "sticky edge" state: the cursor has reached the shared
+	// edge but has not yet broken free. While sticky, the UI shows an
+	// Apple-style glowing edge line whose halo narrows as the cursor presses
+	// closer to the seam, and the break-free dwell interpolates from
+	// StickyDwellMax (light touch) down to StickyDwellMin (firm press).
+	sticky     bool
+	stickyAt   time.Time // when sticky was entered
+	stickyPush float64   // accumulated outward push while sticky
+	// onEdgeUI reports sticky-state changes to the overlay (true=edge line
+	// shown, false=hidden) together with the current halo width in points.
+	// Nil disables the visual layer.
+	onEdgeUI func(on bool, barLen float64)
 
 	clpMu    sync.Mutex
 	lastSet  string // clipboard content last written locally (from client)
@@ -63,6 +84,14 @@ type engine struct {
 
 	sendQ chan frameOut // buffered frames to client writer
 }
+
+// Sticky bar geometry: the halo WIDTH of the edge line when the cursor enters
+// the zone, and the width when pressed hard against the seam (the line spans
+// the full screen height; the halo narrows as the cursor approaches).
+const (
+	stickyBarMax = 14.0
+	stickyBarMin = 6.0
+)
 
 // Status is a snapshot of server state, pushed to the tray/UI via the status
 // callback.
@@ -244,6 +273,65 @@ func (e *engine) run() {
 	log.Printf("mac screen: %dx%d", e.scrW, e.scrH)
 
 	go e.clipboardLoop()
+	go e.stickyDwellLoop()
+}
+
+// stickyDwellLoop drives the sticky-edge visual and timing: it refreshes the
+// light-bar height while the cursor is stuck at the seam, and breaks free
+// (switching to remote) once the cursor has rested there for the dwell that
+// matches how close it is to the edge. It is harmless while not sticky.
+func (e *engine) stickyDwellLoop() {
+	t := time.NewTicker(40 * time.Millisecond)
+	defer t.Stop()
+	for range t.C {
+		if e.isRemote() || !e.sticky {
+			continue
+		}
+		x, _ := mousePos()
+		c := e.edgeCloseness(x)
+		// Keep the light bar glued to the cursor, shrinking as it presses closer.
+		if e.onEdgeUI != nil {
+			e.onEdgeUI(true, stickyBarLen(c))
+		}
+		if time.Since(e.stickyAt) >= e.stickyDwell(c) {
+			e.breakFree()
+		}
+	}
+}
+
+// edgeCloseness returns how close the cursor is to the shared edge, from 0
+// (just entered the sticky zone) to 1 (pressed against the seam).
+func (e *engine) edgeCloseness(x float64) float64 {
+	z := e.cfg.EdgeSensitivity
+	if z <= 0 {
+		return 1
+	}
+	var c float64
+	if e.remoteEdgeIsRight() {
+		c = (x - (e.scrWf() - z)) / z
+	} else {
+		c = (z - x) / z
+	}
+	if c < 0 {
+		c = 0
+	}
+	if c > 1 {
+		c = 1
+	}
+	return c
+}
+
+// stickyDwell is the break-free dwell for a given closeness: a light touch at
+// the zone edge needs StickyDwellMax; pressing against the seam needs only
+// StickyDwellMin.
+func (e *engine) stickyDwell(c float64) time.Duration {
+	span := e.cfg.StickyDwellMax - e.cfg.StickyDwellMin
+	return e.cfg.StickyDwellMax - time.Duration(float64(span)*c)
+}
+
+// stickyBarLen is the light-bar height (px) for a given closeness.
+func stickyBarLen(c float64) float64 {
+	return stickyBarMax - (stickyBarMax-stickyBarMin)*c
 }
 
 // consume is the tap callback adapter. It MUST return the final decision:
@@ -276,50 +364,113 @@ func (e *engine) watchLocal(ev rawEvent) bool {
 			delete(e.keysDown, int(ev.keycode))
 		}
 	}
+	e.afterKeysUpdate()
 
-	// Edge switch on mouse move.
+	// Edge switch on mouse move: reaching the shared edge enters the "sticky"
+	// state (cursor held at the seam with visual feedback); the switch to
+	// remote only happens after breaking free (resting StickyDwell, or pushing
+	// outward by StickyPush).
 	if ev.ctype == cgEventMouseMoved || ev.ctype == cgEventLeftMouseDragged ||
 		ev.ctype == cgEventRightMouseDragged || ev.ctype == cgEventOtherMouseDragged {
 		if x, _ := mousePos(); e.atRemoteEdge(x) {
-			if e.edgeArmed {
-				e.enterRemote()
-				return true
+			if !e.edgeArmed {
+				// Just returned to local with the cursor warped onto the seam;
+				// require it to leave the edge before it can go sticky again.
+			} else if !e.sticky {
+				e.sticky = true
+				e.stickyAt = time.Now()
+				e.stickyPush = 0
+				if e.onEdgeUI != nil {
+					e.onEdgeUI(true, stickyBarLen(e.edgeCloseness(x)))
+				}
+			} else {
+				// Already sticky: accumulate outward push. Pushing "out" means
+				// toward the remote machine, i.e. dx < 0 for a left edge.
+				if e.remoteEdgeIsRight() {
+					if ev.dx > 0 {
+						e.stickyPush += ev.dx
+					}
+				} else if ev.dx < 0 {
+					e.stickyPush -= ev.dx
+				}
+				if e.stickyPush >= e.cfg.StickyPush {
+					e.breakFree()
+					return true
+				}
 			}
 		} else {
-			// Cursor moved away from the shared edge: arm it so a later
-			// crossing can re-enter remote (prevents immediate re-entry after
-			// returning to local with the cursor warped onto the edge).
+			// Cursor moved away from the shared edge: leave sticky and arm it
+			// so a later crossing can re-enter remote (prevents immediate
+			// re-entry after returning to local with the cursor on the seam).
+			if e.sticky {
+				e.sticky = false
+				if e.onEdgeUI != nil {
+					e.onEdgeUI(false, 0)
+				}
+			}
 			e.edgeArmed = true
 		}
 	}
 
 	// Hotkey toggle.
 	if e.hotkeyDown() {
+		e.hotkeyLocked = true
 		e.enterRemote()
 		return true
 	}
 	return false
 }
 
+// breakFree leaves the sticky state and switches control to the remote machine.
+func (e *engine) breakFree() {
+	if !e.sticky {
+		return
+	}
+	e.sticky = false
+	if e.onEdgeUI != nil {
+		e.onEdgeUI(false, 0)
+	}
+	e.enterRemote()
+}
+
 // forwardRemote forwards input to the client.
 func (e *engine) forwardRemote(ev rawEvent) {
+	// Hotkey while remote returns control to the Mac. We check it only on
+	// press events (not on key-up), and only after recording the press, so that
+	// the key-up that follows an enter-remote/leave-remote does not bounce
+	// control back. When the hotkey fires, the press is consumed (NOT forwarded)
+	// so Omarchy's own binding for the same combo never triggers.
 	switch ev.ctype {
-	case cgEventKeyDown, cgEventKeyUp:
-		e.keysDown[int(ev.keycode)] = ev.ctype == cgEventKeyDown
+	case cgEventKeyDown:
+		e.keysDown[int(ev.keycode)] = true
+		if e.hotkeyDown() {
+			e.hotkeyLocked = true
+			e.leaveRemote(-1)
+			return
+		}
+		e.afterKeysUpdate()
 		if code, ok := keymapToEvdev(int(ev.keycode)); ok {
-			p := byte(0)
-			if ev.ctype == cgEventKeyDown {
-				p = 1
-			}
-			e.send(protocol.MsgKey, protocol.EncodeKey(code, p))
+			e.send(protocol.MsgKey, protocol.EncodeKey(code, 1))
+		}
+	case cgEventKeyUp:
+		delete(e.keysDown, int(ev.keycode))
+		e.afterKeysUpdate()
+		if code, ok := keymapToEvdev(int(ev.keycode)); ok {
+			e.send(protocol.MsgKey, protocol.EncodeKey(code, 0))
 		}
 	case cgEventFlagsChanged:
 		down := ev.flags&flagForMacKey(int(ev.keycode)) != 0
 		if down {
 			e.keysDown[int(ev.keycode)] = true
+			if e.hotkeyDown() {
+				e.hotkeyLocked = true
+				e.leaveRemote(-1)
+				return
+			}
 		} else {
 			delete(e.keysDown, int(ev.keycode))
 		}
+		e.afterKeysUpdate()
 		if code, ok := keymapToEvdev(int(ev.keycode)); ok {
 			p := byte(0)
 			if down {
@@ -337,11 +488,6 @@ func (e *engine) forwardRemote(ev rawEvent) {
 		e.sendMouseButton(protocol.ButtonMiddle, u8(ev.ctype == cgEventOtherMouseDown))
 	case cgEventScrollWheel:
 		e.send(protocol.MsgMouseWheel, protocol.EncodeMouseWheel(int16(ev.s2), int16(ev.s1)))
-	}
-
-	// Return path: hotkey pressed while remote -> back to local.
-	if e.hotkeyDown() {
-		e.leaveRemote()
 	}
 }
 
@@ -362,7 +508,11 @@ func (e *engine) enterRemote() {
 		return
 	}
 	e.switchTo(ModeRemote)
-	e.send(protocol.MsgSwitch, []byte("remote"))
+	e.edgeArmed = false // will warp off-screen; require the cursor to leave the edge before re-entering
+	_, y := mousePos()
+	// Tell the client where the Mac cursor was on the seam so it can land at
+	// the same Y (proportionally mapped) instead of a fixed park point.
+	e.send(protocol.MsgSwitch, []byte(fmt.Sprintf("remote:%d", int(y))))
 	// Stop the physical mouse from driving the Mac cursor and hide it.
 	if setMouseAssoc != nil {
 		setMouseAssoc(false)
@@ -373,7 +523,6 @@ func (e *engine) enterRemote() {
 	// Park the Mac cursor off-screen (clamped to the edge on macOS, which is
 	// fine — it will not track the touchpad while disassociated).
 	if warpOffscreen != nil {
-		_, y := mousePos()
 		if e.remoteEdgeIsRight() {
 			warpOffscreen(e.scrWf()+1000, clampY(y))
 		} else {
@@ -386,8 +535,10 @@ func (e *engine) enterRemote() {
 	}
 }
 
-// leaveRemote returns control to the Mac and warps the cursor to the edge.
-func (e *engine) leaveRemote() {
+// leaveRemote returns control to the Mac and warps the cursor to the seam.
+// edgeY is the client-side Y the cursor was at on the remote edge (from the
+// "back:Y" switch request), or -1 to use the current Mac cursor Y.
+func (e *engine) leaveRemote(edgeY float64) {
 	if !e.isRemote() {
 		return
 	}
@@ -401,19 +552,50 @@ func (e *engine) leaveRemote() {
 	if showCursor != nil {
 		showCursor()
 	}
-	_, y := mousePos()
-	if e.remoteEdgeIsRight() {
-		warpMouse(e.scrWf()-1, clampY(y))
+	var y float64
+	if edgeY >= 0 {
+		y = e.mapClientYToMac(edgeY)
 	} else {
-		warpMouse(0, clampY(y))
+		_, y = mousePos()
+	}
+	y = clampY(y)
+	if e.remoteEdgeIsRight() {
+		warpMouse(e.scrWf()-1, y)
+	} else {
+		warpMouse(0, y)
 	}
 }
 
-// handleSwitchRequest processes a client request to return control.
+// handleSwitchRequest processes a client request to return control. Payload is
+// "back" or "back:<client-edge-y>".
 func (e *engine) handleSwitchRequest(payload []byte) {
-	if string(payload) == "back" {
-		e.leaveRemote()
+	s := string(payload)
+	if s != "back" && !strings.HasPrefix(s, "back:") {
+		return
 	}
+	edgeY := -1.0
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		if v, err := strconv.ParseFloat(s[i+1:], 64); err == nil {
+			edgeY = v
+		}
+	}
+	e.leaveRemote(edgeY)
+}
+
+// mapMacYToClient maps a Mac cursor Y to the client's screen Y by proportion.
+func (e *engine) mapMacYToClient(y float64) float64 {
+	if e.cliH > 0 && e.scrH > 0 {
+		return y * float64(e.cliH) / float64(e.scrH)
+	}
+	return y
+}
+
+// mapClientYToMac maps a client-screen Y back to the Mac's screen Y.
+func (e *engine) mapClientYToMac(y float64) float64 {
+	if e.cliH > 0 && e.scrH > 0 {
+		return y * float64(e.scrH) / float64(e.cliH)
+	}
+	return y
 }
 
 func (e *engine) scrWf() float64 { return float64(e.scrW) }
@@ -425,8 +607,12 @@ func (e *engine) atRemoteEdge(x float64) bool {
 	return x <= e.cfg.EdgeSensitivity
 }
 
+// hotkeyDown reports whether all switch-hotkey keys are currently held.
+// hotkeyLocked disables the hotkey after it has fired once, until every hotkey
+// key is physically released, so holding the combo (key auto-repeat) does not
+// bounce control between local and remote repeatedly.
 func (e *engine) hotkeyDown() bool {
-	if len(e.swKeys) == 0 {
+	if e.hotkeyLocked || len(e.swKeys) == 0 {
 		return false
 	}
 	for k := range e.swKeys {
@@ -435,6 +621,20 @@ func (e *engine) hotkeyDown() bool {
 		}
 	}
 	return true
+}
+
+// afterKeysUpdate is called whenever keysDown changes. It unlocks the hotkey
+// once every hotkey key has been released.
+func (e *engine) afterKeysUpdate() {
+	if !e.hotkeyLocked {
+		return
+	}
+	for k := range e.swKeys {
+		if e.keysDown[k] {
+			return // a hotkey key is still held; keep locked
+		}
+	}
+	e.hotkeyLocked = false
 }
 
 // send enqueues a frame for the writer goroutine (non-blocking drop on full).

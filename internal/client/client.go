@@ -5,8 +5,11 @@ package client
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +25,7 @@ type Client struct {
 	remote atomic.Bool
 
 	scrW, scrH float64 // client screen size (set during handshake)
+	macW, macH float64 // server (Mac) screen size (from handshake)
 
 	mu   sync.Mutex
 	conn net.Conn
@@ -157,6 +161,9 @@ func (c *Client) runOnce() error {
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
+	c.mu.Lock()
+	c.macW, c.macH = float64(sw), float64(sh)
+	c.mu.Unlock()
 	log.Printf("connected to uc-server at %s (server screen %dx%d)", c.cfg.ServerAddr, sw, sh)
 
 	for {
@@ -202,34 +209,64 @@ func (c *Client) handle(f protocol.Frame) {
 	case protocol.MsgClipboard:
 		c.applyClipboard(f.Payload)
 	case protocol.MsgSwitch:
-		switch string(f.Payload) {
-		case "remote":
-			c.enterRemote()
-		case "back":
-			c.leaveRemote()
-		}
+		c.handleSwitch(string(f.Payload))
 	}
 }
 
+// handleSwitch processes a control-mode switch request. Payload is "remote"
+// (or "remote:<mac-edge-y>") to take control, and "back" (or "back:<y>") to
+// return it.
+func (c *Client) handleSwitch(s string) {
+	if s == "remote" || strings.HasPrefix(s, "remote:") {
+		edgeY := -1.0
+		if i := strings.IndexByte(s, ':'); i >= 0 {
+			if v, err := strconv.ParseFloat(s[i+1:], 64); err == nil {
+				edgeY = v
+			}
+		}
+		c.enterRemote(edgeY)
+		return
+	}
+	if s == "back" || strings.HasPrefix(s, "back:") {
+		c.leaveRemote()
+		return
+	}
+	log.Printf("warn: unknown switch payload %q", s)
+}
+
 // enterRemote starts injecting and watches the shared edge for a return.
-func (c *Client) enterRemote() {
+// edgeY is the Mac-side Y where the cursor crossed (proportionally mapped onto
+// this screen), or -1 to keep the current Y.
+func (c *Client) enterRemote(edgeY float64) {
 	if c.remote.Swap(true) {
 		return
 	}
 	log.Printf("remote control: Mac -> Omarchy")
-	// Park the virtual cursor just inside the shared edge (keeping its current
-	// Y) so it lines up with the Mac's opposite edge in PBP without sitting
-	// exactly on the return threshold, then begin edge watching.
+	// Park the virtual cursor just inside the shared edge. When the Mac told us
+	// where its cursor crossed (edgeY), land at the same Y (proportionally
+	// mapped) so the crossing feels like a seamless slide; otherwise keep the
+	// current Y. Then begin edge watching.
 	go func() {
 		x, y, err := hyprCursorPos()
 		if err != nil {
 			log.Printf("warn: park: cursorpos failed: %v", err)
 			return
 		}
+		if edgeY >= 0 {
+			y = c.mapMacY(edgeY)
+		}
 		c.moveCursorAbs(c.parkX(), y)
-		log.Printf("parked cursor at x=%.0f (was %.0f)", c.parkX(), x)
+		log.Printf("parked cursor at x=%.0f y=%.0f (was x=%.0f)", c.parkX(), y, x)
 	}()
 	go c.edgeWatch()
+}
+
+// mapMacY maps a Mac-side Y onto this screen's height by proportion.
+func (c *Client) mapMacY(y float64) float64 {
+	if c.scrH > 0 && c.macH > 0 {
+		return y * float64(c.scrH) / float64(c.macH)
+	}
+	return y
 }
 
 // parkX returns the X coordinate to park the virtual cursor at when entering
@@ -249,6 +286,29 @@ func (c *Client) leaveRemote() {
 		return
 	}
 	log.Printf("remote control: returned to Mac")
+	// Release every key and mouse button that may still be held down on the
+	// client. Without this, a hotkey (e.g. Cmd+Shift+Space) pressed to return
+	// could leave modifiers stuck on Omarchy.
+	c.releaseAll()
+}
+
+// releaseAll sends key-up for every possible keycode and releases every mouse
+// button on the virtual device. Sending a key-up for a key that is not pressed
+// is harmless on uinput, so this is a reliable way to clear any stuck state.
+func (c *Client) releaseAll() {
+	if c.dev == nil {
+		return
+	}
+	for code := 0; code < 256; code++ {
+		if err := c.dev.Key(uint16(code), false); err != nil {
+			log.Printf("warn: release key %d: %v", code, err)
+		}
+	}
+	for _, b := range []uint8{protocol.ButtonLeft, protocol.ButtonRight, protocol.ButtonMiddle} {
+		if err := c.dev.MouseButton(b, false); err != nil {
+			log.Printf("warn: release button %d: %v", b, err)
+		}
+	}
 }
 
 // sharedEdgeX returns the X coordinate of the edge shared with the Mac.
@@ -293,7 +353,14 @@ func (c *Client) edgeWatch() {
 			}
 			if time.Since(inZoneSince) >= dwell {
 				log.Printf("edge dwell: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, c.scrW, c.cfg.EdgeMargin, c.cfg.Edge)
-				c.send(protocol.MsgSwitch, []byte("back"))
+				// Tell the server where we crossed so the Mac cursor lands at
+				// the same Y (proportionally) instead of a fixed park point.
+				_, y, errY := hyprCursorPos()
+				if errY != nil {
+					c.send(protocol.MsgSwitch, []byte("back"))
+				} else {
+					c.send(protocol.MsgSwitch, []byte(fmt.Sprintf("back:%d", int(y))))
+				}
 				c.leaveRemote()
 				return
 			}
