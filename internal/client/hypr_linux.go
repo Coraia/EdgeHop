@@ -21,6 +21,9 @@ import (
 // otherwise the cursor never reaches the physical width and edge detection
 // silently never fires.
 func hyprScreenSize() (w, h int, err error) {
+	if !ensureHyprEnv() {
+		return 0, 0, fmt.Errorf("no Hyprland instance available")
+	}
 	out, err := exec.Command("hyprctl", "monitors").Output()
 	if err != nil {
 		return 0, 0, fmt.Errorf("hyprctl monitors: %w", err)
@@ -63,6 +66,9 @@ func parseMonitorSize(out string) (int, int, error) {
 // coordinates by asking Hyprland's IPC ("hyprctl cursorpos" -> "x, y").
 // These coordinates are in the same logical space as hyprScreenSize.
 func hyprCursorPos() (x, y float64, err error) {
+	if !ensureHyprEnv() {
+		return 0, 0, fmt.Errorf("no Hyprland instance available")
+	}
 	out, err := exec.Command("hyprctl", "cursorpos").Output()
 	if err != nil {
 		return 0, 0, fmt.Errorf("hyprctl cursorpos: %w", err)

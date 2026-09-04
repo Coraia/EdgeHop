@@ -12,6 +12,7 @@ import (
 
 // readClipboard returns the current Wayland clipboard text via wl-paste.
 func readClipboard() (string, bool) {
+	ensureWaylandEnv()
 	out, err := exec.Command("wl-paste").Output()
 	if err != nil {
 		return "", false
@@ -21,6 +22,7 @@ func readClipboard() (string, bool) {
 
 // writeClipboard sets the Wayland clipboard via wl-copy.
 func writeClipboard(text string) {
+	ensureWaylandEnv()
 	cmd := exec.Command("wl-copy")
 	cmd.Stdin = strings.NewReader(text)
 	if err := cmd.Run(); err != nil {
