@@ -3,10 +3,11 @@
 package server
 
 /*
-#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation -framework AppKit
+#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation -framework AppKit -framework ApplicationServices
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <dlfcn.h>
@@ -22,7 +23,15 @@ extern int onEventGo(int type, int64_t keycode, int64_t flags,
 void uc_overlay_set_sticky(int on, double cx, double cy, double barLen);
 void uc_overlay_teardown(void);
 
+// Swipe gesture type: NSEventTypeSwipe == 31. Not exposed as a named CGEvent
+// constant, but delivered to session-level event taps.
+#define kUCSwipeEventType 31
+
 static CFMachPortRef g_tap = NULL;
+static CFMachPortRef g_swipe_tap = NULL;
+static int g_swipe_tap_ok = 0;
+
+static int createSwipeTap(void);
 
 static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
                               CGEventRef event, void *refcon) {
@@ -108,7 +117,68 @@ static int createTapAndRun(void) {
     CGEventTapEnable(tap, true);
     CFRelease(src);
     CFRelease(tap);
+    // Second, a session-level tap that only watches trackpad swipe gestures
+    // (three-finger swipes -> Mission Control / Space switching). While remote
+    // control is active we consume them so the Mac does not react to gestures
+    // that should belong to Omarchy. This tap is best-effort: if it fails the
+    // HID tap above still controls the mouse/keyboard.
+    //
+    // Known limitation (docs/known-issues.md Issue #1): system-bound gestures
+    // such as three-finger-up -> Mission Control are recognized by WindowServer
+    // on a separate event path and never reach this tap, so they cannot be
+    // consumed here. Kept as best-effort for non-system swipes.
+    g_swipe_tap_ok = (createSwipeTap() == 0);
+    if (!g_swipe_tap_ok) {
+        fprintf(stderr, "[uc] warning: swipe-gesture tap not installed; "
+                        "trackpad gestures will reach the Mac while remote control is active\n");
+    }
     CFRunLoopRun();
+    return 0;
+}
+
+// isTrusted reports whether this process has been granted Accessibility
+// permission. Used to gate tap creation: calling CGEventTapCreate while
+// untrusted makes macOS pop an authorization dialog, so we must not retry
+// blindly.
+static int isTrusted(void) {
+    return AXIsProcessTrusted() ? 1 : 0;
+}
+
+// Swipe-gesture tap callback. onEventGo returns 0 to consume (Mac must not
+// react to the gesture), 1 to let the system handle it.
+static CGEventRef swipeTapCallback(CGEventTapProxy proxy, CGEventType type,
+                                   CGEventRef event, void *refcon) {
+    (void)proxy; (void)refcon;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (g_swipe_tap != NULL) {
+            CGEventTapEnable(g_swipe_tap, true);
+        }
+        return event;
+    }
+    int64_t dx = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+    int64_t dy = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
+    int decision = onEventGo(kUCSwipeEventType, 0, 0, (double)dx, (double)dy,
+                             -1, dx, dy);
+    if (decision == 0) {
+        return NULL; // consumed: gesture stays on the active machine
+    }
+    return event;
+}
+
+static int createSwipeTap(void) {
+    CGEventMask mask = (CGEventMask)1 << kUCSwipeEventType;
+    CFMachPortRef tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                         kCGEventTapOptionDefault, mask,
+                                         swipeTapCallback, NULL);
+    if (tap == NULL) {
+        return -1;
+    }
+    g_swipe_tap = tap;
+    CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
+    CGEventTapEnable(tap, true);
+    CFRelease(src);
+    CFRelease(tap);
     return 0;
 }
 
@@ -263,12 +333,21 @@ var evHandler func(ev rawEvent) bool
 
 // startEventTap begins the CGEventTap and blocks the calling goroutine.
 // It returns an error if the tap cannot be created (Accessibility missing).
+// The caller must gate calls on isAccessibilityTrusted(): creating a tap while
+// untrusted makes macOS pop an authorization dialog on every attempt.
 func startEventTap(handler func(ev rawEvent) bool) error {
 	evHandler = handler
 	if rc := C.createTapAndRun(); rc != 0 {
 		return errors.New("event tap creation failed: grant the app Accessibility permission in System Settings > Privacy & Security > Accessibility")
 	}
 	return nil
+}
+
+// isAccessibilityTrusted reports whether the app has Accessibility permission.
+// When false, creating event taps triggers repeated system authorization dialogs,
+// so the startup loop waits quietly until the user grants it.
+func isAccessibilityTrusted() bool {
+	return C.isTrusted() == 1
 }
 
 // initDisplay wires the platform display functions used by the engine.

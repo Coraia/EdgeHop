@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"log"
 	"net"
 	"time"
@@ -25,8 +26,16 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 	}
 
 	// Event tap on a dedicated goroutine with retry (never exits the process).
+	// While Accessibility permission is missing we wait quietly instead of
+	// retrying tap creation: each untrusted CGEventTapCreate attempt makes
+	// macOS pop an authorization dialog, which would stack up dialogs.
 	go func() {
 		for {
+			if !isAccessibilityTrusted() {
+				e.reportError(errors.New("waiting for Accessibility permission (System Settings > Privacy & Security > Accessibility)"))
+				time.Sleep(5 * time.Second)
+				continue
+			}
 			if err := startEventTap(e.consume); err != nil {
 				e.reportError(err)
 				time.Sleep(2 * time.Second)
