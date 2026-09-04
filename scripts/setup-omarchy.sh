@@ -9,7 +9,11 @@
 #   1) pacman 安装依赖   wl-clipboard hyprland-utils
 #   2) 配置 /dev/uinput 访问（input 组 + udev 规则）
 #   3) 安装 uc-client 到 /usr/local/bin
-#   4) 写 Hyprland 配置（虚拟指针去加速 + 登录后自启）
+#   4) 写 systemd 服务（开机自启，覆盖登录界面）+ Hyprland 虚拟指针去加速
+#
+# 说明：uc-client 已支持在缺失会话环境变量时自动探测 Hyprland/Wayland
+# socket，因此用 systemd 服务（multi-user.target）从开机一路管到登录会话，
+# 登录界面（SDDM greeter）阶段即可被 Mac 键鼠控制，无需登录后再拉起。
 set -euo pipefail
 
 SERVER=""
@@ -58,27 +62,38 @@ sudo udevadm trigger
 echo "==> 3/4 安装 uc-client 到 /usr/local/bin"
 sudo install -m 755 "$BIN" /usr/local/bin/uc-client
 
-echo "==> 4/4 配置 Hyprland（虚拟指针去加速 + 登录自启）"
+echo "==> 4/4 配置 systemd 开机自启 + Hyprland 虚拟指针去加速"
+# --- systemd 服务：开机即启动（multi-user.target），覆盖登录界面阶段 ---
+SERVICE="/etc/systemd/system/uc-client.service"
+if [ -f "$SERVICE" ]; then
+  echo "    $SERVICE 已存在，跳过创建（如需改参数请手动编辑）。"
+else
+  sudo tee "$SERVICE" >/dev/null <<EOF
+[Unit]
+Description=Universal Control client (boot + login keyboard/mouse)
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+ExecStart=/usr/local/bin/uc-client -server $SERVER:24800 -edge right
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  echo "    已创建 $SERVICE。"
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable uc-client.service
+
+# --- Hyprland 虚拟指针去加速（无登录自启；启动由 systemd 接管） ---
 HYPR_DIR="$HOME/.config/hypr"
 mkdir -p "$HYPR_DIR"
 
 if [ -f "$HYPR_DIR/hyprland.lua" ]; then
   # --- Omarchy 风格 Lua 配置 ---
-  AUTOSTART="$HYPR_DIR/autostart.lua"
-  if grep -q "universal-control" "$AUTOSTART" 2>/dev/null; then
-    echo "    autostart.lua 已包含 universal-control，跳过。"
-    echo "    如需修改参数，请手动编辑 $AUTOSTART 中的 hl.exec_cmd 行。"
-  else
-    cat >> "$AUTOSTART" <<EOF
-
--- universal-control: Mac mini 键鼠控制 Omarchy（登录后自启）
-hl.on("hyprland.start", function()
-  hl.exec_cmd("/usr/local/bin/uc-client -server $SERVER:24800 -edge right")
-end)
-EOF
-    echo "    已写入 autostart.lua（登录自启）。"
-  fi
-
   INPUT="$HYPR_DIR/input.lua"
   if grep -q "universal-control" "$INPUT" 2>/dev/null; then
     echo "    input.lua 已包含 universal-control，跳过。"
@@ -100,7 +115,6 @@ else
   touch "$HYPR"
   if grep -q "universal-control" "$HYPR"; then
     echo "    hyprland.conf 已包含 universal-control，跳过。"
-    echo "    如需修改服务器地址，请手动编辑 $HYPR 中的 exec-once 行。"
   else
     cat >> "$HYPR" <<EOF
 
@@ -110,11 +124,8 @@ input-device {
     accel_profile = flat
     sensitivity = 0
 }
-
-# --- universal-control: 登录后自启 uc-client ---
-exec-once = /usr/local/bin/uc-client -server $SERVER:24800
 EOF
-    echo "    已写入 input-device 去加速 + exec-once 自启。"
+    echo "    已写入 input-device 去加速。"
   fi
 fi
 
@@ -123,9 +134,12 @@ echo "=================================================="
 echo " 完成！已安装并配置 uc-client"
 echo "   服务器地址 : $SERVER:24800"
 echo "   客户端路径 : /usr/local/bin/uc-client"
+echo "   自启方式   : systemd (uc-client.service，开机自启)"
 echo ""
 echo " 接下来："
-echo "   1) 重新登录 Hyprland（让 input 组生效），或临时执行: newgrp input"
-echo "   2) 先手动测试:  /usr/local/bin/uc-client -server $SERVER:24800"
-echo "   3) 确认 Mac 端菜单栏应用/uc-server 已启动并已授权辅助功能"
+echo "   1) 确认 Mac 端菜单栏应用/uc-server 已启动并已授权辅助功能"
+echo "   2) 立即启动:  sudo systemctl start uc-client"
+echo "   3) 查看日志:  journalctl -u uc-client -f"
+echo "   （若目标是登录界面也可控制，需 Omarchy 根分区非 LUKS 加密，"
+echo "     或已配置 keyfile 自动解锁，见 docs/known-issues.md Issue #2）"
 echo "=================================================="
