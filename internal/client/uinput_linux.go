@@ -15,18 +15,18 @@ import (
 
 // evdev event types.
 const (
-	evSyn  = 0x00
-	evKey  = 0x01
-	evRel  = 0x02
-	evMsc  = 0x04
+	evSyn = 0x00
+	evKey = 0x01
+	evRel = 0x02
+	evMsc = 0x04
 )
 
 // Event codes.
 const (
-	relX     = 0x00
-	relY     = 0x01
+	relX      = 0x00
+	relY      = 0x01
 	relHwheel = 0x06
-	relWheel = 0x08
+	relWheel  = 0x08
 	synReport = 0
 )
 
@@ -70,22 +70,13 @@ type inputID struct {
 	Version uint16
 }
 
-// uinputSetup matches the modern struct uinput_setup (92 bytes): name moved
-// before ff_effects_max and ff_effects_max shrank to 32-bit in kernels >= 6.12.
-//   struct { input_id id; char name[80]; __u32 ff_effects_max; }  -> 92 bytes
+// uinputSetup matches struct uinput_setup (92 bytes).
+//
+//	struct { input_id id; char name[80]; __u32 ff_effects_max; }  -> 92 bytes
 type uinputSetup struct {
 	ID           inputID
 	Name         [80]byte
 	FfEffectsMax uint32
-}
-
-// uinputSetupOld matches the pre-6.12 struct uinput_setup (96 bytes):
-//   struct { input_id id; __u64 ff_effects_max; char name[80]; }  -> 96 bytes
-// Only used as an EINVAL fallback for older kernels.
-type uinputSetupOld struct {
-	ID           inputID
-	FfEffectsMax uint64
-	Name         [80]byte
 }
 
 // inputEvent matches struct input_event (24 bytes on 64-bit Linux).
@@ -148,16 +139,10 @@ func OpenVirtualDevice(name string) (*VirtualDevice, error) {
 	}
 	copy(setup.Name[:], name)
 
-	// Modern kernels require UI_DEV_SETUP before UI_DEV_CREATE (the legacy
-	// uinput_user_dev path was removed). If the modern 92-byte layout is
-	// rejected with EINVAL, retry with the pre-6.12 96-byte layout.
+	// Modern uinput uses UI_DEV_SETUP before UI_DEV_CREATE.
 	if err := applySetup(f, unsafe.Pointer(&setup), unsafe.Sizeof(setup)); err != nil {
-		old := uinputSetupOld{ID: setup.ID}
-		copy(old.Name[:], name)
-		if err2 := applySetup(f, unsafe.Pointer(&old), unsafe.Sizeof(old)); err2 != nil {
-			d.Close()
-			return nil, err2
-		}
+		d.Close()
+		return nil, err
 	}
 	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(),
 		ioc(0, ioctlTypeU, uiDevCreate, 0), 0); e != 0 {

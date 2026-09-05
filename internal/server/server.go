@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"time"
 	"universal_control/internal/protocol"
+	"universal_control/internal/secureconn"
 )
 
 // Run starts the macOS server: the event tap, the engine, and the network
@@ -18,9 +21,18 @@ func Run(cfg Config) error {
 // by the menu-bar app). The event tap is retried until it succeeds, so
 // granting Accessibility later takes effect without a restart.
 func RunWithStatus(cfg Config, onStatus func(Status)) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	auth, err := secureconn.New(cfg.PairingSecret)
+	if err != nil {
+		return err
+	}
 	initDisplay()
 	e := newEngine(cfg)
-	e.onEdgeUI = func(on bool, barLen float64) { setStickyOverlay(on, barLen) }
+	e.onEdgeUI = func(on bool, barLen float64) {
+		setStickyOverlay(on, barLen, cfg.RemoteEdge == EdgeRight)
+	}
 	if onStatus != nil {
 		e.setOnStatus(onStatus)
 	}
@@ -36,6 +48,7 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 				time.Sleep(5 * time.Second)
 				continue
 			}
+			e.updateStatus(func(s *Status) { s.LastError = "" })
 			if err := startEventTap(e.consume); err != nil {
 				e.reportError(err)
 				time.Sleep(2 * time.Second)
@@ -47,11 +60,6 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 
 	// Engine drives modes/clipboard.
 	go e.run()
-
-	// Optionally dial the client (if ClientAddr configured) with reconnects.
-	if cfg.ClientAddr != "" {
-		go e.dialLoop(cfg.ClientAddr)
-	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -70,45 +78,41 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go e.handleConn(c)
-	}
-}
-
-// dialLoop keeps one client connection alive by dialing ClientAddr.
-func (e *engine) dialLoop(addr string) {
-	for {
-		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
-		if err != nil {
-			log.Printf("connect %s failed: %v (retrying in 3s)", addr, err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		e.handleConn(c)
+		go func() {
+			secure, err := auth.Accept(c)
+			if err != nil {
+				log.Printf("rejected connection from %s: %v", c.RemoteAddr(), err)
+				return
+			}
+			e.handleConn(secure)
+		}()
 	}
 }
 
 // handleConn performs the handshake and then relays messages for one client.
 func (e *engine) handleConn(c net.Conn) {
 	cc := newClientConn(c)
-	frameCh := make(chan protocol.Frame, 128)
-	go readLoop(c, frameCh)
+	r := bufio.NewReader(c)
 
 	// Handshake with timeout.
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	hello, ok := <-frameCh
-	if !ok || hello.Type != protocol.MsgHello {
+	hello, err := protocol.ReadFrame(r)
+	if err != nil || hello.Type != protocol.MsgHello || string(hello.Payload) != protocol.Version {
 		log.Printf("handshake failed from %s", c.RemoteAddr())
 		c.Close()
 		return
 	}
-	scr, ok := <-frameCh
-	if !ok || scr.Type != protocol.MsgScreen {
+	scr, err := protocol.ReadFrame(r)
+	if err != nil || scr.Type != protocol.MsgScreen {
 		log.Printf("missing screen info from %s", c.RemoteAddr())
 		c.Close()
 		return
 	}
 	cliW, cliH, err := protocol.DecodeScreen(scr.Payload)
-	if err != nil {
+	if err != nil || cliW < 0 || cliH < 0 {
+		if err == nil {
+			err = fmt.Errorf("invalid screen size %dx%d", cliW, cliH)
+		}
 		log.Printf("bad screen payload from %s: %v", c.RemoteAddr(), err)
 		c.Close()
 		return
@@ -117,7 +121,8 @@ func (e *engine) handleConn(c net.Conn) {
 	e.setClientScreen(cliW, cliH)
 
 	sc := screen()
-	if err := cc.Send(protocol.MsgHello, []byte("universal-control/1")); err != nil {
+	e.refreshScreen()
+	if err := cc.Send(protocol.MsgHello, []byte(protocol.Version)); err != nil {
 		c.Close()
 		return
 	}
@@ -133,12 +138,13 @@ func (e *engine) handleConn(c net.Conn) {
 	// (e.g. the client reconnected while we were controlling Omarchy), tell it
 	// so its edge-watch / input path starts correctly.
 	if e.isRemote() {
-		_ = cc.Send(protocol.MsgSwitch, []byte("remote"))
+		_ = cc.Send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
+			Direction: protocol.SwitchRemote,
+		}))
 		log.Printf("re-synced remote mode to reconnected client")
 	}
-	e.recvLoop(cc, frameCh)
+	e.recvLoop(r)
 
 	e.dropConn(cc)
-	_ = c.Close()
 	log.Printf("client disconnected: %s", c.RemoteAddr())
 }

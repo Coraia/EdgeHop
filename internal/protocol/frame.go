@@ -15,14 +15,17 @@ import (
 )
 
 // MaxFrameSize guards against unbounded memory usage from malicious/broken peers.
-const MaxFrameSize = 16 << 20 // 16 MiB
+const MaxFrameSize = 1 << 20 // 1 MiB
+
+// Version is exchanged after the secure transport is established.
+const Version = "universal-control/2"
 
 // ErrFrameTooLarge is returned when a frame exceeds MaxFrameSize.
 var ErrFrameTooLarge = errors.New("protocol: frame too large")
 
 // Message types.
 const (
-	// MsgHello: client -> server handshake ("universal-control/1").
+	// MsgHello: client -> server handshake (Version).
 	MsgHello byte = 0x01
 	// MsgScreen: server -> client screen geometry (w:int32, h:int32).
 	MsgScreen byte = 0x02
@@ -38,7 +41,7 @@ const (
 	MsgKey byte = 0x20
 	// MsgClipboard: either direction; payload is UTF-8 text.
 	MsgClipboard byte = 0x30
-	// MsgSwitch: control-mode switch request. Client -> server: "back".
+	// MsgSwitch: control-mode switch request encoded by EncodeSwitch.
 	MsgSwitch byte = 0x40
 )
 
@@ -199,6 +202,53 @@ func DecodeKey(p []byte) (evcode uint16, pressed uint8, err error) {
 	return evcode, p[2], nil
 }
 
+// SwitchDirection identifies which machine should receive control.
+type SwitchDirection uint8
+
+const (
+	// SwitchRemote transfers control from the Mac to Linux.
+	SwitchRemote SwitchDirection = 1
+	// SwitchBack transfers control from Linux to the Mac.
+	SwitchBack SwitchDirection = 2
+)
+
+// Switch is the typed MsgSwitch payload. Y is valid only when HasY is true.
+type Switch struct {
+	Direction SwitchDirection
+	Y         int32
+	HasY      bool
+}
+
+// EncodeSwitch builds a fixed-width MsgSwitch payload.
+func EncodeSwitch(s Switch) []byte {
+	payload := make([]byte, 6)
+	payload[0] = byte(s.Direction)
+	if s.HasY {
+		payload[1] = 1
+		binary.BigEndian.PutUint32(payload[2:6], uint32(s.Y))
+	}
+	return payload
+}
+
+// DecodeSwitch parses and validates a MsgSwitch payload.
+func DecodeSwitch(payload []byte) (Switch, error) {
+	if len(payload) != 6 {
+		return Switch{}, errors.New("protocol: invalid switch payload size")
+	}
+	direction := SwitchDirection(payload[0])
+	if direction != SwitchRemote && direction != SwitchBack {
+		return Switch{}, errors.New("protocol: invalid switch direction")
+	}
+	if payload[1] > 1 {
+		return Switch{}, errors.New("protocol: invalid switch coordinate flag")
+	}
+	result := Switch{Direction: direction, HasY: payload[1] == 1}
+	if result.HasY {
+		result.Y = int32(binary.BigEndian.Uint32(payload[2:6]))
+	}
+	return result, nil
+}
+
 // String returns a human-readable description of a frame type.
 func (f Frame) String() string {
 	switch f.Type {
@@ -225,7 +275,11 @@ func (f Frame) String() string {
 	case MsgClipboard:
 		return fmt.Sprintf("Clipboard(%d bytes)", len(f.Payload))
 	case MsgSwitch:
-		return fmt.Sprintf("Switch(%q)", string(f.Payload))
+		message, err := DecodeSwitch(f.Payload)
+		if err != nil {
+			return "Switch(invalid)"
+		}
+		return fmt.Sprintf("Switch(direction=%d y=%d hasY=%t)", message.Direction, message.Y, message.HasY)
 	default:
 		return fmt.Sprintf("Unknown(type=%d,len=%d)", f.Type, len(f.Payload))
 	}

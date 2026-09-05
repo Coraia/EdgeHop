@@ -20,6 +20,11 @@ func newClientConn(c net.Conn) *clientConn {
 	return &clientConn{c: c, w: bufio.NewWriter(c)}
 }
 
+// Close terminates the underlying network connection.
+func (cc *clientConn) Close() error {
+	return cc.c.Close()
+}
+
 // Send writes one frame and flushes.
 func (cc *clientConn) Send(typ byte, payload []byte) error {
 	cc.mu.Lock()
@@ -31,20 +36,4 @@ func (cc *clientConn) Send(typ byte, payload []byte) error {
 		return err
 	}
 	return cc.w.Flush()
-}
-
-// readLoop decodes frames from the connection until failure, then closes ch.
-func readLoop(c net.Conn, ch chan<- protocol.Frame) {
-	defer close(ch)
-	r := bufio.NewReader(c)
-	for {
-		f, err := protocol.ReadFrame(r)
-		if err != nil {
-			return
-		}
-		select {
-		case ch <- f:
-		default: // reader too slow: drop oldest is complex; drop frame instead
-		}
-	}
 }

@@ -2,8 +2,9 @@
 # 在 Omarchy（Arch + Hyprland / Wayland）上一键安装并自启 uc-client。
 #
 # 用法：
-#   ./setup-omarchy.sh -s 192.168.1.10              # 自动匹配架构的客户端二进制（需在脚本同目录）
+#   ./setup-omarchy.sh -s 192.168.1.10
 #   ./setup-omarchy.sh -s 192.168.1.10 -b ./uc-client-linux-amd64
+# 脚本会静默提示粘贴配对码，避免密钥进入 shell 历史和进程参数。
 #
 # 做什么：
 #   1) pacman 安装依赖   wl-clipboard hyprland-utils
@@ -18,6 +19,9 @@ set -euo pipefail
 
 SERVER=""
 BIN=""
+PAIRING_CODE=""
+INSTALL_ROOT="${UC_INSTALL_ROOT:-}"
+SKIP_SYSTEM_COMMANDS="${UC_SKIP_SYSTEM_COMMANDS:-0}"
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)   BIN_DEFAULT="./uc-client-linux-amd64" ;;
@@ -37,56 +41,84 @@ done
 [ -n "$SERVER" ] || usage
 [ -n "$BIN" ] || BIN="$BIN_DEFAULT"
 [ -f "$BIN" ] || { echo "找不到客户端二进制: $BIN" >&2; exit 1; }
+[[ "$SERVER" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "无效的 Mac 地址: $SERVER" >&2; exit 1; }
 
-if ! command -v pacman >/dev/null 2>&1; then
+if [ -t 0 ]; then
+  read -r -s -p "粘贴 Mac 菜单中复制的配对码: " PAIRING_CODE
+  echo
+else
+  IFS= read -r PAIRING_CODE
+fi
+[[ "$PAIRING_CODE" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "无效的配对码。" >&2; exit 1; }
+
+if [ "$SKIP_SYSTEM_COMMANDS" != "1" ] && ! command -v pacman >/dev/null 2>&1; then
   echo "未找到 pacman，本脚本仅支持 Arch 系（Omarchy）。" >&2
   exit 1
 fi
 
 echo "==> 1/4 安装依赖 (wl-clipboard)"
-sudo pacman -S --needed --noconfirm wl-clipboard || { echo "安装 wl-clipboard 失败，请检查网络/源。" >&2; exit 1; }
-# hyprctl 由 hyprland 包提供；hyprland-utils 仅在部分发行版存在，缺失不影响功能
-sudo pacman -S --needed --noconfirm hyprland-utils 2>/dev/null \
-  || echo "    (hyprland-utils 不存在，hyprctl 已随 hyprland 提供，跳过)"
-command -v hyprctl >/dev/null 2>&1 || echo "    (警告: 未找到 hyprctl，边缘切回检测不可用)"
+if [ "$SKIP_SYSTEM_COMMANDS" != "1" ]; then
+  sudo pacman -S --needed --noconfirm wl-clipboard || { echo "安装 wl-clipboard 失败，请检查网络/源。" >&2; exit 1; }
+  # hyprctl 由 hyprland 包提供；hyprland-utils 仅在部分发行版存在，缺失不影响功能
+  sudo pacman -S --needed --noconfirm hyprland-utils 2>/dev/null \
+    || echo "    (hyprland-utils 不存在，hyprctl 已随 hyprland 提供，跳过)"
+  command -v hyprctl >/dev/null 2>&1 || echo "    (警告: 未找到 hyprctl，边缘切回检测不可用)"
+fi
 
 echo "==> 2/4 配置 /dev/uinput 访问权限"
-sudo usermod -aG input "$USER"
-RULES="/etc/udev/rules.d/99-universal-control.rules"
-if [ ! -f "$RULES" ]; then
+RULES="$INSTALL_ROOT/etc/udev/rules.d/99-universal-control.rules"
+if [ "$SKIP_SYSTEM_COMMANDS" = "1" ]; then
+  mkdir -p "$(dirname "$RULES")"
+  echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' > "$RULES"
+else
+  sudo usermod -aG input "$USER"
   echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' | sudo tee "$RULES" >/dev/null
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger
 fi
-sudo udevadm control --reload-rules
-sudo udevadm trigger
 
 echo "==> 3/4 安装 uc-client 到 /usr/local/bin"
-sudo install -m 755 "$BIN" /usr/local/bin/uc-client
+CLIENT_BIN="$INSTALL_ROOT/usr/local/bin/uc-client"
+if [ "$SKIP_SYSTEM_COMMANDS" = "1" ]; then
+  mkdir -p "$(dirname "$CLIENT_BIN")"
+  install -m 755 "$BIN" "$CLIENT_BIN"
+else
+  sudo install -m 755 "$BIN" "$CLIENT_BIN"
+fi
+
+PAIRING_DIR="$HOME/.config/universal-control"
+PAIRING_FILE="$PAIRING_DIR/pairing.key"
+install -d -m 700 "$PAIRING_DIR"
+printf '%s\n' "$PAIRING_CODE" > "$PAIRING_FILE"
+chmod 600 "$PAIRING_FILE"
 
 echo "==> 4/4 配置 systemd 开机自启 + Hyprland 虚拟指针去加速"
 # --- systemd 服务：开机即启动（multi-user.target），覆盖登录界面阶段 ---
-SERVICE="/etc/systemd/system/uc-client.service"
-if [ -f "$SERVICE" ]; then
-  echo "    $SERVICE 已存在，跳过创建（如需改参数请手动编辑）。"
-else
-  sudo tee "$SERVICE" >/dev/null <<EOF
-[Unit]
+SERVICE="$INSTALL_ROOT/etc/systemd/system/uc-client.service"
+SERVICE_CONTENT="[Unit]
 Description=Universal Control client (boot + login keyboard/mouse)
 After=network.target
 
 [Service]
 Type=simple
 User=$USER
-ExecStart=/usr/local/bin/uc-client -server $SERVER:24800 -edge right
+ExecStart=/usr/local/bin/uc-client -server $SERVER:24800 -pairing-file $PAIRING_FILE -edge right
 Restart=always
 RestartSec=3
 
 [Install]
-WantedBy=multi-user.target
-EOF
-  echo "    已创建 $SERVICE。"
+WantedBy=multi-user.target"
+
+if [ "$SKIP_SYSTEM_COMMANDS" = "1" ]; then
+  mkdir -p "$(dirname "$SERVICE")"
+  printf '%s\n' "$SERVICE_CONTENT" > "$SERVICE"
+else
+  printf '%s\n' "$SERVICE_CONTENT" | sudo tee "$SERVICE" >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl enable uc-client.service
+  sudo systemctl restart uc-client.service
 fi
-sudo systemctl daemon-reload
-sudo systemctl enable uc-client.service
+echo "    已更新 ${SERVICE}。"
 
 # --- Hyprland 虚拟指针去加速（无登录自启；启动由 systemd 接管） ---
 HYPR_DIR="$HOME/.config/hypr"
@@ -113,19 +145,30 @@ else
   # --- 标准 hyprland.conf（通用 Arch/Hyprland） ---
   HYPR="$HYPR_DIR/hyprland.conf"
   touch "$HYPR"
+  if grep -q "input-device {" "$HYPR" && grep -q "universal-control" "$HYPR"; then
+    TMP_HYPR="${HYPR}.universal-control.tmp"
+    awk '
+      /^# --- universal-control: 虚拟指针去加速 ---$/ { in_uc = 1 }
+      in_uc && /^input-device[[:space:]]*\{/ { sub(/^input-device/, "device") }
+      { print }
+      in_uc && /^}/ { in_uc = 0 }
+    ' "$HYPR" > "$TMP_HYPR"
+    mv "$TMP_HYPR" "$HYPR"
+    echo "    已迁移旧 input-device 配置。"
+  fi
   if grep -q "universal-control" "$HYPR"; then
     echo "    hyprland.conf 已包含 universal-control，跳过。"
   else
     cat >> "$HYPR" <<EOF
 
 # --- universal-control: 虚拟指针去加速 ---
-input-device {
+device {
     name = universal-control
     accel_profile = flat
     sensitivity = 0
 }
 EOF
-    echo "    已写入 input-device 去加速。"
+    echo "    已写入 device 去加速。"
   fi
 fi
 
@@ -134,11 +177,12 @@ echo "=================================================="
 echo " 完成！已安装并配置 uc-client"
 echo "   服务器地址 : $SERVER:24800"
 echo "   客户端路径 : /usr/local/bin/uc-client"
+echo "   配对密钥   : $PAIRING_FILE"
 echo "   自启方式   : systemd (uc-client.service，开机自启)"
 echo ""
 echo " 接下来："
 echo "   1) 确认 Mac 端菜单栏应用/uc-server 已启动并已授权辅助功能"
-echo "   2) 立即启动:  sudo systemctl start uc-client"
+echo "   2) 服务状态:  systemctl status uc-client"
 echo "   3) 查看日志:  journalctl -u uc-client -f"
 echo "   （若目标是登录界面也可控制，需 Omarchy 根分区非 LUKS 加密，"
 echo "     或已配置 keyfile 自动解锁，见 docs/known-issues.md Issue #2）"

@@ -11,7 +11,7 @@ func TestRoundTripAllMessages(t *testing.T) {
 		typ     byte
 		payload []byte
 	}{
-		{MsgHello, []byte("universal-control/1")},
+		{MsgHello, []byte(Version)},
 		{MsgScreen, EncodeScreen(1920, 1080)},
 		{MsgMouseMove, EncodeMouseMove(-12, 34)},
 		{MsgMouseAbs, EncodeMouseAbs(1880, 540)},
@@ -19,7 +19,7 @@ func TestRoundTripAllMessages(t *testing.T) {
 		{MsgMouseWheel, EncodeMouseWheel(0, -3)},
 		{MsgKey, EncodeKey(30, 1)}, // KEY_A
 		{MsgClipboard, []byte("你好, world 中文 ✓")},
-		{MsgSwitch, []byte("back")},
+		{MsgSwitch, EncodeSwitch(Switch{Direction: SwitchBack})},
 	}
 	var buf bytes.Buffer
 	for _, c := range cases {
@@ -88,5 +88,20 @@ func TestTruncatedFrame(t *testing.T) {
 	r := bufio.NewReader(&buf)
 	if _, err := ReadFrame(r); err == nil {
 		t.Fatal("expected error on truncated frame")
+	}
+}
+
+func TestSwitchRoundTripAndValidation(t *testing.T) {
+	want := Switch{Direction: SwitchRemote, Y: 540, HasY: true}
+	got, err := DecodeSwitch(EncodeSwitch(want))
+	if err != nil {
+		t.Fatalf("DecodeSwitch: %v", err)
+	}
+	if got != want {
+		t.Fatalf("switch = %+v, want %+v", got, want)
+	}
+
+	if _, err := DecodeSwitch([]byte("remote:garbage")); err == nil {
+		t.Fatal("DecodeSwitch accepted a malformed payload")
 	}
 }

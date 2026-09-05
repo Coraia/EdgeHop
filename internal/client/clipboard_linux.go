@@ -13,7 +13,7 @@ import (
 // readClipboard returns the current Wayland clipboard text via wl-paste.
 func readClipboard() (string, bool) {
 	ensureWaylandEnv()
-	out, err := exec.Command("wl-paste").Output()
+	out, err := exec.Command("wl-paste", "--no-newline").Output()
 	if err != nil {
 		return "", false
 	}
@@ -47,13 +47,9 @@ func (c *Client) clipboardLoop() {
 		if !ok || cur == "" {
 			continue
 		}
-		c.clpMu.Lock()
-		if cur == c.lastSet || cur == c.lastSent {
-			c.clpMu.Unlock()
+		if !c.clipboard.ShouldSend(cur) {
 			continue
 		}
-		c.lastSent = cur
-		c.clpMu.Unlock()
 		c.send(protocol.MsgClipboard, []byte(cur))
 	}
 }
@@ -65,8 +61,6 @@ func (c *Client) applyClipboard(payload []byte) {
 		return
 	}
 	text := string(payload)
-	c.clpMu.Lock()
-	c.lastSet = text
-	c.clpMu.Unlock()
+	c.clipboard.AppliedRemote(text)
 	writeClipboard(text)
 }

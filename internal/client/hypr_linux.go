@@ -4,9 +4,7 @@ package client
 
 import (
 	"fmt"
-	"math"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -29,37 +27,6 @@ func hyprScreenSize() (w, h int, err error) {
 		return 0, 0, fmt.Errorf("hyprctl monitors: %w", err)
 	}
 	return parseMonitorSize(string(out))
-}
-
-// parseMonitorSize extracts the logical monitor size from "hyprctl monitors"
-// output. It handles a scale factor (integer like 2 or fractional like 1.25).
-func parseMonitorSize(out string) (int, int, error) {
-	var phW, phH int
-	scale := 1.0
-	reRes := regexp.MustCompile(`^\s*(\d+)x(\d+)@`)
-	reScale := regexp.MustCompile(`^\s*scale:\s*([0-9.]+)`)
-	var err error
-	for _, line := range strings.Split(out, "\n") {
-		if m := reRes.FindStringSubmatch(line); m != nil {
-			phW, err = strconv.Atoi(m[1])
-			if err != nil {
-				continue
-			}
-			phH, err = strconv.Atoi(m[2])
-			if err != nil {
-				continue
-			}
-		}
-		if m := reScale.FindStringSubmatch(line); m != nil {
-			if f, ferr := strconv.ParseFloat(m[1], 64); ferr == nil && f > 0 {
-				scale = f
-			}
-		}
-	}
-	if phW <= 0 || phH <= 0 {
-		return 0, 0, fmt.Errorf("no monitor size found in hyprctl monitors")
-	}
-	return int(math.Round(float64(phW) / scale)), int(math.Round(float64(phH) / scale)), nil
 }
 
 // hyprCursorPos returns the current cursor position in Omarchy screen

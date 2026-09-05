@@ -5,24 +5,26 @@ package client
 import (
 	"bufio"
 	"errors"
-	"fmt"
 	"log"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"universal_control/internal/clipsync"
 	"universal_control/internal/protocol"
+	"universal_control/internal/secureconn"
 )
 
 // Client runs on the Omarchy machine. It connects to uc-server on the Mac,
 // injects received input through uinput, and watches its own left edge to hand
 // control back.
 type Client struct {
-	cfg    Config
-	dev    *VirtualDevice
-	remote atomic.Bool
+	cfg        Config
+	dev        inputDevice
+	auth       *secureconn.Authenticator
+	screenSize func() (int, int, error)
+	remote     atomic.Bool
+	inputMu    sync.Mutex
 
 	scrW, scrH float64 // client screen size (set during handshake)
 	macW, macH float64 // server (Mac) screen size (from handshake)
@@ -31,24 +33,39 @@ type Client struct {
 	conn net.Conn
 	w    *bufio.Writer
 
-	clpMu    sync.Mutex
-	lastSet  string
-	lastSent string
+	clipboard clipsync.Tracker
 
 	stop     chan struct{}
 	stopOnce sync.Once
 }
 
+type inputDevice interface {
+	Close() error
+	Key(code uint16, pressed bool) error
+	MouseMoveRel(dx, dy int16) error
+	MouseButton(button uint8, pressed bool) error
+	MouseWheel(dx, dy int16) error
+}
+
 // New creates a client. The uinput device is opened immediately.
 func New(cfg Config) (*Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	auth, err := secureconn.New(cfg.PairingSecret)
+	if err != nil {
+		return nil, err
+	}
 	dev, err := OpenVirtualDevice(cfg.DeviceName)
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{
-		cfg:  cfg,
-		dev:  dev,
-		stop: make(chan struct{}),
+		cfg:        cfg,
+		dev:        dev,
+		auth:       auth,
+		screenSize: hyprScreenSize,
+		stop:       make(chan struct{}),
 	}
 	return c, nil
 }
@@ -68,6 +85,7 @@ func (c *Client) Close() error {
 // Run connects to the server and processes messages until stopped.
 func (c *Client) Run() error {
 	go c.clipboardLoop()
+	go c.screenLoop()
 	for {
 		select {
 		case <-c.stop:
@@ -110,16 +128,16 @@ func (c *Client) send(typ byte, payload []byte) {
 
 // runOnce dials, handshakes and serves one connection.
 func (c *Client) runOnce() error {
-	conn, err := net.DialTimeout("tcp", c.cfg.ServerAddr, 5*time.Second)
+	raw, err := net.DialTimeout("tcp", c.cfg.ServerAddr, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	conn, err := c.auth.Connect(raw)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	c.mu.Lock()
-	c.conn = conn
-	c.w = bufio.NewWriter(conn)
-	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
 		c.conn = nil
@@ -128,10 +146,11 @@ func (c *Client) runOnce() error {
 	}()
 
 	// Handshake: Hello + our screen size, then read the server's screen size.
-	if err := protocol.WriteFrame(c.w, protocol.MsgHello, []byte("universal-control/1")); err != nil {
+	w := bufio.NewWriter(conn)
+	if err := protocol.WriteFrame(w, protocol.MsgHello, []byte(protocol.Version)); err != nil {
 		return err
 	}
-	cw, ch, err := hyprScreenSize()
+	cw, ch, err := c.screenSize()
 	if err != nil {
 		cw, ch = 0, 0
 		log.Printf("warn: screen detection failed: %v", err)
@@ -139,17 +158,17 @@ func (c *Client) runOnce() error {
 	c.mu.Lock()
 	c.scrW, c.scrH = float64(cw), float64(ch)
 	c.mu.Unlock()
-	if err := protocol.WriteFrame(c.w, protocol.MsgScreen, protocol.EncodeScreen(int32(cw), int32(ch))); err != nil {
+	if err := protocol.WriteFrame(w, protocol.MsgScreen, protocol.EncodeScreen(int32(cw), int32(ch))); err != nil {
 		return err
 	}
-	if err := c.w.Flush(); err != nil {
+	if err := w.Flush(); err != nil {
 		return err
 	}
 
 	r := bufio.NewReader(conn)
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	hello, err := protocol.ReadFrame(r)
-	if err != nil || hello.Type != protocol.MsgHello {
+	if err != nil || hello.Type != protocol.MsgHello || string(hello.Payload) != protocol.Version {
 		return errors.New("handshake: bad hello from server")
 	}
 	scr, err := protocol.ReadFrame(r)
@@ -162,6 +181,8 @@ func (c *Client) runOnce() error {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	c.mu.Lock()
+	c.conn = conn
+	c.w = w
 	c.macW, c.macH = float64(sw), float64(sh)
 	c.mu.Unlock()
 	log.Printf("connected to uc-server at %s (server screen %dx%d)", c.cfg.ServerAddr, sw, sh)
@@ -177,6 +198,13 @@ func (c *Client) runOnce() error {
 
 // handle dispatches one frame from the server.
 func (c *Client) handle(f protocol.Frame) {
+	if isInputFrame(f.Type) {
+		c.inputMu.Lock()
+		defer c.inputMu.Unlock()
+		if !c.remote.Load() {
+			return
+		}
+	}
 	switch f.Type {
 	case protocol.MsgMouseMove:
 		dx, dy, err := protocol.DecodeMouseMove(f.Payload)
@@ -209,29 +237,42 @@ func (c *Client) handle(f protocol.Frame) {
 	case protocol.MsgClipboard:
 		c.applyClipboard(f.Payload)
 	case protocol.MsgSwitch:
-		c.handleSwitch(string(f.Payload))
+		message, err := protocol.DecodeSwitch(f.Payload)
+		if err == nil {
+			c.handleSwitch(message)
+		}
+	case protocol.MsgScreen:
+		w, h, err := protocol.DecodeScreen(f.Payload)
+		if err == nil && w > 0 && h > 0 {
+			c.mu.Lock()
+			c.macW, c.macH = float64(w), float64(h)
+			c.mu.Unlock()
+		}
 	}
 }
 
-// handleSwitch processes a control-mode switch request. Payload is "remote"
-// (or "remote:<mac-edge-y>") to take control, and "back" (or "back:<y>") to
-// return it.
-func (c *Client) handleSwitch(s string) {
-	if s == "remote" || strings.HasPrefix(s, "remote:") {
+func isInputFrame(typ byte) bool {
+	switch typ {
+	case protocol.MsgMouseMove, protocol.MsgMouseButton, protocol.MsgMouseWheel, protocol.MsgKey:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleSwitch processes a validated control-mode switch request.
+func (c *Client) handleSwitch(message protocol.Switch) {
+	if message.Direction == protocol.SwitchRemote {
 		edgeY := -1.0
-		if i := strings.IndexByte(s, ':'); i >= 0 {
-			if v, err := strconv.ParseFloat(s[i+1:], 64); err == nil {
-				edgeY = v
-			}
+		if message.HasY {
+			edgeY = float64(message.Y)
 		}
 		c.enterRemote(edgeY)
 		return
 	}
-	if s == "back" || strings.HasPrefix(s, "back:") {
+	if message.Direction == protocol.SwitchBack {
 		c.leaveRemote()
-		return
 	}
-	log.Printf("warn: unknown switch payload %q", s)
 }
 
 // enterRemote starts injecting and watches the shared edge for a return.
@@ -263,8 +304,9 @@ func (c *Client) enterRemote(edgeY float64) {
 
 // mapMacY maps a Mac-side Y onto this screen's height by proportion.
 func (c *Client) mapMacY(y float64) float64 {
-	if c.scrH > 0 && c.macH > 0 {
-		return y * float64(c.scrH) / float64(c.macH)
+	_, scrH, _, macH := c.screenGeometry()
+	if scrH > 0 && macH > 0 {
+		return y * scrH / macH
 	}
 	return y
 }
@@ -277,7 +319,8 @@ func (c *Client) parkX() float64 {
 	if c.cfg.Edge == "left" {
 		return inset
 	}
-	return c.scrW - inset
+	scrW, _, _, _ := c.screenGeometry()
+	return scrW - inset
 }
 
 // leaveRemote stops edge watching.
@@ -289,7 +332,9 @@ func (c *Client) leaveRemote() {
 	// Release every key and mouse button that may still be held down on the
 	// client. Without this, a hotkey (e.g. Cmd+Shift+Space) pressed to return
 	// could leave modifiers stuck on Omarchy.
+	c.inputMu.Lock()
 	c.releaseAll()
+	c.inputMu.Unlock()
 }
 
 // releaseAll sends key-up for every possible keycode and releases every mouse
@@ -309,14 +354,6 @@ func (c *Client) releaseAll() {
 			log.Printf("warn: release button %d: %v", b, err)
 		}
 	}
-}
-
-// sharedEdgeX returns the X coordinate of the edge shared with the Mac.
-func (c *Client) sharedEdgeX() float64 {
-	if c.cfg.Edge == "left" {
-		return 0
-	}
-	return c.scrW
 }
 
 // edgeWatch polls the cursor and asks the server for control back when the
@@ -343,8 +380,9 @@ func (c *Client) edgeWatch() {
 			continue
 		}
 		atEdge := x <= c.cfg.EdgeMargin
+		scrW, _, _, _ := c.screenGeometry()
 		if c.cfg.Edge == "right" {
-			atEdge = x >= c.scrW-c.cfg.EdgeMargin
+			atEdge = x >= scrW-c.cfg.EdgeMargin
 		}
 		if atEdge {
 			if inZoneSince.IsZero() {
@@ -352,14 +390,20 @@ func (c *Client) edgeWatch() {
 				continue
 			}
 			if time.Since(inZoneSince) >= dwell {
-				log.Printf("edge dwell: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, c.scrW, c.cfg.EdgeMargin, c.cfg.Edge)
+				log.Printf("edge dwell: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, scrW, c.cfg.EdgeMargin, c.cfg.Edge)
 				// Tell the server where we crossed so the Mac cursor lands at
 				// the same Y (proportionally) instead of a fixed park point.
 				_, y, errY := hyprCursorPos()
 				if errY != nil {
-					c.send(protocol.MsgSwitch, []byte("back"))
+					c.send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
+						Direction: protocol.SwitchBack,
+					}))
 				} else {
-					c.send(protocol.MsgSwitch, []byte(fmt.Sprintf("back:%d", int(y))))
+					c.send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
+						Direction: protocol.SwitchBack,
+						Y:         int32(y),
+						HasY:      true,
+					}))
 				}
 				c.leaveRemote()
 				return
@@ -368,6 +412,42 @@ func (c *Client) edgeWatch() {
 			inZoneSince = time.Time{}
 		}
 	}
+}
+
+func (c *Client) screenLoop() {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if c.connected() {
+				c.refreshScreen()
+			}
+		case <-c.stop:
+			return
+		}
+	}
+}
+
+func (c *Client) refreshScreen() {
+	w, h, err := c.screenSize()
+	if err != nil || w <= 0 || h <= 0 {
+		return
+	}
+	c.mu.Lock()
+	changed := c.scrW != float64(w) || c.scrH != float64(h)
+	c.scrW, c.scrH = float64(w), float64(h)
+	c.mu.Unlock()
+	if changed {
+		c.send(protocol.MsgScreen, protocol.EncodeScreen(int32(w), int32(h)))
+		log.Printf("screen geometry updated: %dx%d", w, h)
+	}
+}
+
+func (c *Client) screenGeometry() (scrW, scrH, macW, macH float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.scrW, c.scrH, c.macW, c.macH
 }
 
 // moveCursorAbs nudges the virtual cursor to (x, y) using a feedback loop,
@@ -383,9 +463,16 @@ func (c *Client) moveCursorAbs(x, y float64) {
 		if dx == 0 && dy == 0 {
 			return
 		}
-		if err := c.dev.MouseMoveRel(dx, dy); err != nil {
+		c.inputMu.Lock()
+		if !c.remote.Load() {
+			c.inputMu.Unlock()
 			return
 		}
+		if err := c.dev.MouseMoveRel(dx, dy); err != nil {
+			c.inputMu.Unlock()
+			return
+		}
+		c.inputMu.Unlock()
 		time.Sleep(15 * time.Millisecond)
 	}
 }

@@ -9,16 +9,19 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"universal_control/internal/secureconn"
 	"universal_control/internal/server"
 )
 
 func main() {
 	var (
 		listen       = flag.String("listen", "0.0.0.0:24800", "TCP listen address")
-		connect      = flag.String("connect", "", "client address to auto-connect (e.g. 192.168.1.20:24800); empty = accept inbound only")
+		pairingFile  = flag.String("pairing-file", filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "universal-control", "pairing.key"), "shared pairing key file")
 		edge         = flag.String("edge", "right", "which edge of the Mac screen touches the client: right or left")
 		swKeysRaw    = flag.String("switch-keys", "", "comma-separated macOS keycodes for a hotkey that toggles remote mode (e.g. 55,56,49)")
 		sensitivity  = flag.Float64("edge-sensitivity", 2.0, "edge margin in points that triggers switching")
@@ -28,14 +31,16 @@ func main() {
 
 	cfg := server.DefaultConfig()
 	cfg.ListenAddr = *listen
-	cfg.ClientAddr = *connect
-	if *edge != server.EdgeRight && *edge != server.EdgeLeft {
-		log.Fatalf("invalid -edge %q (want right|left)", *edge)
+	secret, _, err := secureconn.LoadOrCreateSecret(*pairingFile)
+	if err != nil {
+		log.Fatalf("pairing key: %v", err)
 	}
+	cfg.PairingSecret = secret
 	cfg.RemoteEdge = *edge
 	cfg.EdgeSensitivity = *sensitivity
 	cfg.ClipboardPollInterval = *clipInterval
 	if *swKeysRaw != "" {
+		cfg.SwitchKeys = nil
 		for _, p := range strings.Split(*swKeysRaw, ",") {
 			v, err := strconv.Atoi(strings.TrimSpace(p))
 			if err != nil {
@@ -45,7 +50,7 @@ func main() {
 		}
 	}
 
-	log.Printf("uc-server starting: listen=%s connect=%q edge=%s", cfg.ListenAddr, cfg.ClientAddr, cfg.RemoteEdge)
+	log.Printf("uc-server starting: listen=%s edge=%s", cfg.ListenAddr, cfg.RemoteEdge)
 	if err := server.Run(cfg); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}

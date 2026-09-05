@@ -16,6 +16,7 @@
 // ---- StickyOverlayView ----
 @interface StickyOverlayView : NSView
 @property(nonatomic) int sticky;
+@property(nonatomic) int rightEdge;
 @property(nonatomic) double cx, cy;
 @property(nonatomic) double barLen;
 @end
@@ -38,6 +39,7 @@
     double H = self.bounds.size.height;      // full screen height
     double totalW = MAX(6.0, self.barLen);   // halo width (14 -> 6)
     double coreW = 2.0;                       // bright core line
+    double edgeX = self.rightEdge ? self.bounds.size.width - totalW : 0;
     int segs = 48;
     for (int i = 0; i <= segs; i++) {
         double x0 = totalW * (double)i / (double)segs;
@@ -56,7 +58,9 @@
         double cr = 1.0 - t * 0.30;
         double cg = 1.0 - t * 0.20;
         double cb = 1.0;
-        NSRect seg = NSMakeRect(x0, 0, totalW / (double)segs + 0.5, H);
+        double segW = totalW / (double)segs + 0.5;
+        double drawX = self.rightEdge ? edgeX + totalW - x0 - segW : edgeX + x0;
+        NSRect seg = NSMakeRect(drawX, 0, segW, H);
         [[NSColor colorWithCalibratedRed:cr green:cg blue:cb alpha:alpha] setFill];
         NSRectFill(seg);
     }
@@ -97,10 +101,11 @@ static void ensureWindow(void) {
 // uc_overlay_set_sticky shows (on=1) or hides (on=0) the sticky feedback.
 // cx, cy are global Quartz coordinates (top-left origin); barLen is the
 // current bar height in points.
-void uc_overlay_set_sticky(int on, double cx, double cy, double barLen) {
+void uc_overlay_set_sticky(int on, int rightEdge, double cx, double cy, double barLen) {
     dispatch_async(dispatch_get_main_queue(), ^{
         ensureWindow();
         gView.sticky = on;
+        gView.rightEdge = rightEdge;
         gView.cx = cx;
         gView.cy = cy;
         gView.barLen = barLen;

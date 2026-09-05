@@ -15,7 +15,9 @@ chmod +x dist/omarchy-install/setup-omarchy.sh
 
 tar -C dist -czf dist/omarchy-install.tar.gz omarchy-install
 rm -rf dist/omarchy-install
+shasum -a 256 dist/omarchy-install.tar.gz > dist/omarchy-install.tar.gz.sha256
 
 echo "==> done: dist/omarchy-install.tar.gz"
 echo "    拷到 Omarchy 后解压并执行:"
 echo "    tar xzf omarchy-install.tar.gz && cd omarchy-install && ./setup-omarchy.sh -s <Mac IP>"
+echo "    按提示粘贴 Mac 菜单中复制的配对码。"

@@ -15,10 +15,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"text/template"
 	"time"
 
 	"github.com/getlantern/systray"
+	"universal_control/internal/secureconn"
 	"universal_control/internal/server"
 )
 
@@ -40,10 +42,14 @@ func configFilePath() string {
 		"universal-control", "config.json")
 }
 
+func pairingFilePath() string {
+	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support",
+		"universal-control", "pairing.key")
+}
+
 type fileConfig struct {
 	Listen     string `json:"listen"`
 	Edge       string `json:"edge"`
-	Connect    string `json:"connect"`
 	SwitchKeys []int  `json:"switchKeys"` // macOS keycodes to hold together to toggle remote (nil/empty = default Cmd+Shift+Space)
 }
 
@@ -54,13 +60,12 @@ var defaultSwitchKeys = []int{55, 56, 49} // Command, Shift, Space
 
 func main() {
 	var (
-		listen  = flag.String("listen", "0.0.0.0:24800", "TCP listen address")
-		edge    = flag.String("edge", "right", "client edge: right or left")
-		connect = flag.String("connect", "", "client address to auto-connect (optional)")
+		listen = flag.String("listen", "0.0.0.0:24800", "TCP listen address")
+		edge   = flag.String("edge", "right", "client edge: right or left")
 	)
 	set := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
 	// Apply optional config file for flags not given on the command line.
 	switchKeys := defaultSwitchKeys
@@ -71,17 +76,18 @@ func main() {
 		if !set["edge"] && (fc.Edge == "left" || fc.Edge == "right") {
 			*edge = fc.Edge
 		}
-		if !set["connect"] && fc.Connect != "" {
-			*connect = fc.Connect
-		}
 		if len(fc.SwitchKeys) > 0 {
 			switchKeys = fc.SwitchKeys
 		}
 	}
 
 	setupLogging()
+	secret, pairingCode, err := secureconn.LoadOrCreateSecret(pairingFilePath())
+	if err != nil {
+		log.Fatalf("pairing key: %v", err)
+	}
 
-	systray.Run(func() { onReady(*listen, *edge, *connect, switchKeys) }, onExit)
+	systray.Run(func() { onReady(*listen, *edge, switchKeys, secret, pairingCode) }, onExit)
 }
 
 func readFileConfig() (*fileConfig, error) {
@@ -97,7 +103,7 @@ func readFileConfig() (*fileConfig, error) {
 }
 
 // onReady runs on the main thread once the tray icon is live.
-func onReady(listen, edge, connect string, switchKeys []int) {
+func onReady(listen, edge string, switchKeys []int, pairingSecret []byte, pairingCode string) {
 	systray.SetTemplateIcon(menuIcon, menuIcon)
 	systray.SetTooltip(tooltip)
 
@@ -111,6 +117,7 @@ func onReady(listen, edge, connect string, switchKeys []int) {
 	systray.AddSeparator()
 	openAccessItem := systray.AddMenuItem("打开辅助功能设置", "首次使用需在此授权")
 	openLogItem := systray.AddMenuItem("打开日志", "查看运行日志")
+	copyPairingItem := systray.AddMenuItem("复制配对码", "复制 Linux 客户端安装所需的配对码")
 	loginItem := systray.AddMenuItemCheckbox("登录时自动启动", "登录后自动运行本应用", loginItemEnabled())
 
 	systray.AddSeparator()
@@ -128,18 +135,28 @@ func onReady(listen, edge, connect string, switchKeys []int) {
 		}
 	}()
 	go func() {
+		for range copyPairingItem.ClickedCh {
+			cmd := exec.Command("/usr/bin/pbcopy")
+			cmd.Stdin = strings.NewReader(pairingCode)
+			if err := cmd.Run(); err != nil {
+				log.Printf("copy pairing code: %v", err)
+			}
+		}
+	}()
+	go func() {
 		for range loginItem.ClickedCh {
-			on := loginItem.Checked()
-			if on {
-				if err := enableLoginItem(); err != nil {
-					log.Printf("enable login item: %v", err)
-					loginItem.Uncheck()
-				}
-			} else {
+			if loginItem.Checked() {
 				if err := disableLoginItem(); err != nil {
 					log.Printf("disable login item: %v", err)
-					loginItem.Check()
+					continue
 				}
+				loginItem.Uncheck()
+			} else {
+				if err := enableLoginItem(); err != nil {
+					log.Printf("enable login item: %v", err)
+					continue
+				}
+				loginItem.Check()
 			}
 		}
 	}()
@@ -152,7 +169,7 @@ func onReady(listen, edge, connect string, switchKeys []int) {
 	cfg := server.DefaultConfig()
 	cfg.ListenAddr = listen
 	cfg.RemoteEdge = edge
-	cfg.ClientAddr = connect
+	cfg.PairingSecret = pairingSecret
 	cfg.SwitchKeys = switchKeys
 	go func() {
 		if err := server.RunWithStatus(cfg, func(s server.Status) {
@@ -178,6 +195,8 @@ func updateStatus(serverItem, clientItem, modeItem *systray.MenuItem, s server.S
 	modeItem.SetTitle("模式: " + s.Mode)
 	if s.LastError != "" {
 		modeItem.SetTooltip(s.LastError)
+	} else {
+		modeItem.SetTooltip("当前控制模式")
 	}
 }
 

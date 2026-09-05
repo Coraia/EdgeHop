@@ -11,30 +11,36 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 	"universal_control/internal/client"
+	"universal_control/internal/secureconn"
 )
 
 func main() {
 	var (
-		server     = flag.String("server", "", "Mac mini address, e.g. 192.168.1.10:24800 (required)")
-		device     = flag.String("device", "universal-control", "uinput device name")
-		edge       = flag.String("edge", "right", "which edge of the Omarchy screen faces the Mac: \"right\" if Omarchy is on the left of the PBP display, \"left\" if Omarchy is on the right")
-		edgeMargin = flag.Float64("edge-margin", 2.0, "edge distance (px) that returns control to the Mac")
-		clipInt    = flag.Duration("clip-interval", 500*time.Millisecond, "clipboard poll interval")
-		edgePoll   = flag.Duration("edge-poll", 40*time.Millisecond, "cursor edge poll interval")
+		server      = flag.String("server", "", "Mac mini address, e.g. 192.168.1.10:24800 (required)")
+		pairingFile = flag.String("pairing-file", filepath.Join(os.Getenv("HOME"), ".config", "universal-control", "pairing.key"), "shared pairing key file")
+		device      = flag.String("device", "universal-control", "uinput device name")
+		edge        = flag.String("edge", "right", "which edge of the Omarchy screen faces the Mac: \"right\" if Omarchy is on the left of the PBP display, \"left\" if Omarchy is on the right")
+		edgeMargin  = flag.Float64("edge-margin", 8.0, "edge distance (px) that returns control to the Mac")
+		clipInt     = flag.Duration("clip-interval", 500*time.Millisecond, "clipboard poll interval")
+		edgePoll    = flag.Duration("edge-poll", 40*time.Millisecond, "cursor edge poll interval")
 	)
 	flag.Parse()
 
 	if *server == "" {
 		log.Fatal("missing -server (Mac mini address)")
 	}
-	if *edge != "left" && *edge != "right" {
-		log.Fatalf("invalid -edge %q (want left or right)", *edge)
-	}
 
 	cfg := client.DefaultConfig()
+	secret, _, err := secureconn.LoadSecret(*pairingFile)
+	if err != nil {
+		log.Fatalf("pairing key: %v", err)
+	}
 	cfg.ServerAddr = *server
+	cfg.PairingSecret = secret
 	cfg.DeviceName = *device
 	cfg.Edge = *edge
 	cfg.EdgeMargin = *edgeMargin

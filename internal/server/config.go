@@ -1,16 +1,19 @@
 package server
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+	"universal_control/internal/secureconn"
+)
 
 // Config configures the macOS server.
 type Config struct {
 	// ListenAddr is the TCP listen address, e.g. "0.0.0.0:24800".
 	ListenAddr string
 
-	// ClientAddr is the Omarchy machine address to auto-connect to, e.g.
-	// "192.168.1.20:24800". If empty, the server waits for an incoming
-	// connection (either direction is supported).
-	ClientAddr string
+	// PairingSecret authenticates and encrypts the client connection.
+	PairingSecret []byte
 
 	// RemoteEdge is which edge of the Mac screen connects to the client.
 	// "right" means the Omarchy screen sits to the right (PBP layout with
@@ -49,12 +52,39 @@ type Config struct {
 // DefaultConfig returns a sensible default configuration.
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:           "0.0.0.0:24800",
-		RemoteEdge:           "right",
-		EdgeSensitivity:      8.0,
-		StickyDwellMin:       300 * time.Millisecond,
-		StickyDwellMax:       1 * time.Second,
-		StickyPush:           4.0,
+		ListenAddr:            "0.0.0.0:24800",
+		RemoteEdge:            "right",
+		SwitchKeys:            []int{55, 56, 49},
+		EdgeSensitivity:       8.0,
+		StickyDwellMin:        300 * time.Millisecond,
+		StickyDwellMax:        1 * time.Second,
+		StickyPush:            4.0,
 		ClipboardPollInterval: 500 * time.Millisecond,
 	}
+}
+
+// Validate checks configuration before any goroutines or event taps start.
+func (c Config) Validate() error {
+	if c.ListenAddr == "" {
+		return errors.New("server: listen address is required")
+	}
+	if c.RemoteEdge != EdgeLeft && c.RemoteEdge != EdgeRight {
+		return fmt.Errorf("server: invalid edge %q", c.RemoteEdge)
+	}
+	if err := secureconn.ValidateSecret(c.PairingSecret); err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
+	if c.EdgeSensitivity <= 0 {
+		return errors.New("server: edge sensitivity must be positive")
+	}
+	if c.StickyDwellMin <= 0 || c.StickyDwellMax < c.StickyDwellMin {
+		return errors.New("server: sticky dwell range is invalid")
+	}
+	if c.StickyPush <= 0 {
+		return errors.New("server: sticky push must be positive")
+	}
+	if c.ClipboardPollInterval <= 0 {
+		return errors.New("server: clipboard interval must be positive")
+	}
+	return nil
 }

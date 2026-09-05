@@ -29,9 +29,7 @@ func writeClipboard(text string) {
 	}
 }
 
-// clipboardLoop polls the macOS clipboard and forwards changes to the client.
-// Echo guard: content that originated from the client (lastSet) or was already
-// forwarded (lastSent) is not re-sent.
+// clipboardLoop polls the macOS clipboard and forwards new local changes.
 func (e *engine) clipboardLoop() {
 	t := time.NewTicker(e.cfg.ClipboardPollInterval)
 	defer t.Stop()
@@ -43,13 +41,9 @@ func (e *engine) clipboardLoop() {
 		if !ok || cur == "" {
 			continue
 		}
-		e.clpMu.Lock()
-		if cur == e.lastSet || cur == e.lastSent {
-			e.clpMu.Unlock()
+		if !e.clipboard.ShouldSend(cur) {
 			continue
 		}
-		e.lastSent = cur
-		e.clpMu.Unlock()
 		e.send(protocol.MsgClipboard, []byte(cur))
 	}
 }
@@ -61,8 +55,6 @@ func (e *engine) applyClipboard(payload []byte) {
 		return
 	}
 	text := string(payload)
-	e.clpMu.Lock()
-	e.lastSet = text
-	e.clpMu.Unlock()
+	e.clipboard.AppliedRemote(text)
 	writeClipboard(text)
 }

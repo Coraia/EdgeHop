@@ -32,7 +32,7 @@
   - 剪贴板通过 `pbpaste`/`pbcopy` 轮询同步。
 - **uc-client**（跑在 Omarchy）：纯 Go 直写 `/dev/uinput` 注入键鼠事件（免 cgo、免 ydotool 守护进程），用 `wl-copy`/`wl-paste` 同步剪贴板；通过 `hyprctl cursorpos` 检测光标到 Omarchy **右边缘**，请求切回 Mac。
   - **环境自动探测**：缺失 `HYPRLAND_INSTANCE_SIGNATURE` / `WAYLAND_DISPLAY` 时自动从 `/run/user/<uid>/hypr` 与 `wayland-*` socket 探测，因此可由 systemd 在登录前启动、登录后无缝接管，无需重启。
-- 协议：自研长度前缀二进制帧（鼠标移动/点击/滚轮/键盘/剪贴板/切换），端口默认 `24800`。
+- 协议：TLS 1.3 加密通道 + 随机共享配对密钥，内部使用长度前缀二进制帧（鼠标移动/点击/滚轮/键盘/剪贴板/切换），端口默认 `24800`。
 
 ## 构建
 
@@ -41,6 +41,7 @@
 ```bash
 make build          # 产出 bin/uc-server、bin/uc-client-linux-amd64、bin/uc-client-linux-arm64
 make bundle         # 生成 macOS 菜单栏应用 dist/universal-control.app
+make dmg            # 生成 macOS 26 arm64 安装镜像 dist/universal-control-macos26-arm64.dmg
 make omarchy-installer  # 生成 Omarchy 一键安装包 dist/omarchy-install.tar.gz
 ```
 
@@ -49,14 +50,16 @@ make omarchy-installer  # 生成 Omarchy 一键安装包 dist/omarchy-install.ta
 ### 方式 A：菜单栏应用（推荐，免开终端）
 
 ```bash
-make bundle
-open dist/universal-control.app
+make dmg
+open dist/universal-control-macos26-arm64.dmg
 ```
 
+- 将 **Universal Control.app** 拖入 Applications 后运行。当前安装包面向 **macOS 26 arm64**，采用本地签名、未做 Apple 公证，首次打开如被拦截，请在 Finder 中右键应用并选择“打开”；
 - 运行后右上角菜单栏出现 Universal Control 图标，服务器同进程自动启动；
 - **授予辅助功能（Accessibility）权限**：系统设置 → 隐私与安全性 → 辅助功能，勾选 `universal-control`。未授权时应用会静默等待，不再反复弹授权框；
-- 菜单可查看服务器/客户端/模式状态、打开辅助功能设置、打开日志（`~/Library/Logs/universal-control.log`）、勾选"登录时自动启动"（写入 LaunchAgent）、退出；
+- 菜单可查看服务器/客户端/模式状态、复制配对码、打开辅助功能设置、打开日志（`~/Library/Logs/universal-control.log`）、勾选"登录时自动启动"（写入 LaunchAgent）、退出；
 - 应用为 `LSUIElement`，不占 Dock。
+- 首次启动会生成 `~/Library/Application Support/universal-control/pairing.key`（权限 `0600`）。在安装 Linux 客户端时粘贴菜单中的配对码；两端配对码不一致时连接会被拒绝。
 - **边缘方向配置**：写入 `~/Library/Application Support/universal-control/config.json`，默认布局（Omarchy 在左）为：
 
   ```json
@@ -79,9 +82,10 @@ open dist/universal-control.app
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-listen` | `0.0.0.0:24800` | 监听地址 |
+| `-pairing-file` | Application Support 下的 `pairing.key` | 共享配对密钥文件；不存在时自动生成 |
 | `-edge` | `right` | Omarchy 在 Mac 的哪一侧：`right`/`left` |
 | `-edge-sensitivity` | `2.0` | 触发切换的边缘像素余量 |
-| `-switch-keys` | 空 | 手动切换热键的 macOS 键码，逗号分隔，如 `55,56,49`（Cmd+Shift+空格） |
+| `-switch-keys` | `55,56,49` | 手动切换热键的 macOS 键码，逗号分隔；显式传参会替换默认值 |
 | `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
 
 ## Omarchy 端部署（uc-client）
@@ -90,8 +94,10 @@ open dist/universal-control.app
 
 ```bash
 tar xzf omarchy-install.tar.gz && cd omarchy-install
-./setup-omarchy.sh -s <Mac mini 的IP>        # 自动匹配架构；也可 -b 指定二进制
+./setup-omarchy.sh -s <Mac mini 的IP>
 ```
+
+按静默提示粘贴 Mac 菜单中复制的配对码。配对码不会出现在 shell 历史或进程参数中。
 
 脚本会自动完成：
 1. `pacman` 安装 `wl-clipboard`、`hyprland-utils`；
@@ -118,6 +124,12 @@ tar xzf omarchy-install.tar.gz && cd omarchy-install
 
 3. **systemd 服务**（开机自启，覆盖登录界面；登录后仍由它管理，无需会话内拉起）：
 
+   ```bash
+   install -d -m 700 ~/.config/universal-control
+   printf '%s\n' '<Mac 菜单中复制的配对码>' > ~/.config/universal-control/pairing.key
+   chmod 600 ~/.config/universal-control/pairing.key
+   ```
+
    ```ini
    # /etc/systemd/system/uc-client.service
    [Unit]
@@ -127,7 +139,7 @@ tar xzf omarchy-install.tar.gz && cd omarchy-install
    [Service]
    Type=simple
    User=$USER
-   ExecStart=/usr/local/bin/uc-client -server <Mac mini 的IP>:24800 -edge right
+   ExecStart=/usr/local/bin/uc-client -server <Mac mini 的IP>:24800 -pairing-file %h/.config/universal-control/pairing.key -edge right
    Restart=always
    RestartSec=3
 
@@ -144,7 +156,7 @@ tar xzf omarchy-install.tar.gz && cd omarchy-install
 4. **让虚拟指针平滑**：在 `~/.config/hypr/hyprland.conf` 中加：
 
    ```ini
-   input-device {
+   device {
        name = universal-control
        accel_profile = flat
        sensitivity = 0
@@ -156,6 +168,7 @@ tar xzf omarchy-install.tar.gz && cd omarchy-install
    | 参数 | 默认 | 说明 |
    |---|---|---|
    | `-server` | （必填） | Mac mini 地址，如 `192.168.1.10:24800` |
+   | `-pairing-file` | `~/.config/universal-control/pairing.key` | Mac 与 Linux 共用的配对密钥文件 |
    | `-device` | `universal-control` | uinput 设备名（与 hyprland.conf 一致） |
    | `-edge` | `right` | Omarchy 的哪一侧对着 Mac：`right`（Omarchy 在左）、`left`（Omarchy 在右） |
    | `-edge-margin` | `8` | 边缘多少像素内触发切回 Mac（逻辑像素） |
@@ -189,11 +202,14 @@ cmd/uc-server/          macOS 端入口（命令行）
 cmd/uc-tray/            菜单栏应用入口（systray + 内嵌服务器）
 cmd/uc-client/          Linux 端入口
 internal/protocol/      网络协议（两端共用，含单测）
+internal/secureconn/    TLS 1.3 + 共享密钥双向认证（含单测）
+internal/clipsync/      剪贴板回声抑制状态（含单测）
 internal/keymap/        macOS 键码 → Linux evdev 键码（含单测）
 internal/server/        macOS 实现（CGEventTap、剪贴板、切换引擎、状态回调、边缘特效 overlay）
 internal/client/        Linux 实现（uinput 注入、wl-clipboard、边缘检测、环境自动探测）
 tools/genicon/          菜单栏模板图标生成器
 scripts/bundle-macos.sh .app 打包脚本（LSUIElement + ad-hoc 签名）
+scripts/make-macos-dmg.sh macOS 26 arm64 DMG 打包和校验脚本
 scripts/setup-omarchy.sh Omarchy 一键安装/自启脚本（systemd 服务）
 scripts/make-omarchy-installer.sh Omarchy 安装器 tar 打包
 docs/known-issues.md    已知问题登记

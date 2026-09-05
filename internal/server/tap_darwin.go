@@ -20,7 +20,7 @@ extern int onEventGo(int type, int64_t keycode, int64_t flags,
                      int64_t scrollAxis1, int64_t scrollAxis2);
 
 // Sticky-edge overlay (overlay_darwin.m).
-void uc_overlay_set_sticky(int on, double cx, double cy, double barLen);
+void uc_overlay_set_sticky(int on, int rightEdge, double cx, double cy, double barLen);
 void uc_overlay_teardown(void);
 
 // Swipe gesture type: NSEventTypeSwipe == 31. Not exposed as a named CGEvent
@@ -195,13 +195,10 @@ static double mouseY(void) {
     CFRelease(e);
     return p.y;
 }
-static int screenW(void) {
+static void screenSize(int *w, int *h) {
     CGRect b = CGDisplayBounds(CGMainDisplayID());
-    return (int)b.size.width;
-}
-static int screenH(void) {
-    CGRect b = CGDisplayBounds(CGMainDisplayID());
-    return (int)b.size.height;
+    *w = (int)b.size.width;
+    *h = (int)b.size.height;
 }
 static void warpMouse(double x, double y) {
     CGEventRef e = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
@@ -353,7 +350,9 @@ func isAccessibilityTrusted() bool {
 // initDisplay wires the platform display functions used by the engine.
 func initDisplay() {
 	screen = func() screenSize {
-		return screenSize{W: float64(C.screenW()), H: float64(C.screenH())}
+		var w, h C.int
+		C.screenSize(&w, &h)
+		return screenSize{W: float64(w), H: float64(h)}
 	}
 	mousePos = func() (float64, float64) {
 		return float64(C.mouseX()), float64(C.mouseY())
@@ -386,11 +385,15 @@ func initDisplay() {
 // cursor position. barLen is the current bar height in points. It is safe to
 // call from any goroutine; the ObjC overlay dispatches the actual AppKit work
 // to the main queue.
-func setStickyOverlay(on bool, barLen float64) {
+func setStickyOverlay(on bool, barLen float64, rightEdge bool) {
 	x, y := mousePos()
 	onI := 0
 	if on {
 		onI = 1
 	}
-	C.uc_overlay_set_sticky(C.int(onI), C.double(x), C.double(y), C.double(barLen))
+	rightI := 0
+	if rightEdge {
+		rightI = 1
+	}
+	C.uc_overlay_set_sticky(C.int(onI), C.int(rightI), C.double(x), C.double(y), C.double(barLen))
 }

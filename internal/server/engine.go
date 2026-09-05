@@ -1,13 +1,12 @@
 package server
 
 import (
-	"fmt"
+	"bufio"
 	"log"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"universal_control/internal/clipsync"
 	"universal_control/internal/protocol"
 )
 
@@ -38,23 +37,28 @@ const (
 // to suppress the event. Network sends are enqueued to sendQ and drained by a
 // separate writer goroutine, so a slow client never blocks the tap.
 type engine struct {
-	cfg    Config
-	mode   atomic.Int32
-	remote atomic.Bool // fast path: whether we are currently forwarding
+	cfg     Config
+	mode    atomic.Int32
+	remote  atomic.Bool // fast path: whether we are currently forwarding
+	stateMu sync.Mutex
 
-	mu    sync.Mutex
-	conn  netConn // current client connection writer (nil if disconnected)
-	scrW  int32   // Mac screen size (cached)
-	scrH  int32
-	cliW  int32 // client screen size (from handshake)
-	cliH  int32
+	mu   sync.Mutex
+	conn netConn // current client connection writer (nil if disconnected)
+	scrW int32   // Mac screen size (cached)
+	scrH int32
+	cliW int32 // client screen size (from handshake)
+	cliH int32
 
-	swKeys   map[int]bool // hotkey codes for manual toggle
-	keysDown map[int]bool // mac keycodes currently down
+	swKeys      map[int]bool // hotkey codes for manual toggle
+	keysDown    map[int]bool // mac keycodes currently down
+	buttonsDown map[int]bool // Mac mouse buttons currently down
 
 	// hotkeyLocked prevents the switch-hotkey from firing again until all of
 	// its keys are released (see hotkeyDown).
 	hotkeyLocked bool
+	// pendingRemote delays a local-to-remote switch until the local machine
+	// has received key-up events for the hotkey that requested the switch.
+	pendingRemote bool
 
 	// edgeArmed gates edge re-entry after returning to local: the cursor must
 	// first move away from the shared edge before an edge crossing will switch
@@ -74,9 +78,7 @@ type engine struct {
 	// Nil disables the visual layer.
 	onEdgeUI func(on bool, barLen float64)
 
-	clpMu    sync.Mutex
-	lastSet  string // clipboard content last written locally (from client)
-	lastSent string // clipboard content last forwarded to the client
+	clipboard clipsync.Tracker
 
 	statusMu sync.Mutex
 	status   Status
@@ -104,11 +106,13 @@ type Status struct {
 
 type netConn interface {
 	Send(typ byte, payload []byte) error
+	Close() error
 }
 
 type frameOut struct {
 	typ     byte
 	payload []byte
+	conn    netConn
 }
 
 // rawEvent is a normalized event from the cgo tap.
@@ -164,10 +168,12 @@ func (e *engine) remoteEdgeIsRight() bool {
 // newEngine builds an engine from config and wires platform functions.
 func newEngine(cfg Config) *engine {
 	e := &engine{
-		cfg:      cfg,
-		sendQ:    make(chan frameOut, 4096),
-		swKeys:   make(map[int]bool, len(cfg.SwitchKeys)),
-		keysDown: make(map[int]bool),
+		cfg:         cfg,
+		sendQ:       make(chan frameOut, 256),
+		swKeys:      make(map[int]bool, len(cfg.SwitchKeys)),
+		keysDown:    make(map[int]bool),
+		buttonsDown: make(map[int]bool),
+		status:      Status{Mode: modeName(ModeLocal)},
 	}
 	for _, k := range cfg.SwitchKeys {
 		e.swKeys[k] = true
@@ -203,8 +209,12 @@ func (e *engine) updateStatus(mut func(*Status)) {
 // setConn installs a new client connection.
 func (e *engine) setConn(c netConn) {
 	e.mu.Lock()
+	old := e.conn
 	e.conn = c
 	e.mu.Unlock()
+	if old != nil && old != c {
+		_ = old.Close()
+	}
 }
 
 // dropConn clears the connection only if it is the current one.
@@ -215,12 +225,29 @@ func (e *engine) dropConn(c netConn) {
 	}
 	gone := e.conn == nil
 	e.mu.Unlock()
+	_ = c.Close()
 	if gone {
 		// Lost the client: force back to local control.
+		e.stateMu.Lock()
+		wasRemote := e.isRemote()
 		e.switchTo(ModeLocal)
-		if showCursor != nil {
-			showCursor()
+		e.sticky = false
+		e.pendingRemote = false
+		e.hotkeyLocked = false
+		clear(e.keysDown)
+		clear(e.buttonsDown)
+		if e.onEdgeUI != nil {
+			e.onEdgeUI(false, 0)
 		}
+		if wasRemote {
+			if setMouseAssoc != nil {
+				setMouseAssoc(true)
+			}
+			if showCursor != nil {
+				showCursor()
+			}
+		}
+		e.stateMu.Unlock()
 		e.updateStatus(func(s *Status) { s.ClientConnected = false })
 		log.Printf("control returned to local (client gone)")
 	}
@@ -231,6 +258,22 @@ func (e *engine) setClientScreen(w, h int32) {
 	e.mu.Lock()
 	e.cliW, e.cliH = w, h
 	e.mu.Unlock()
+}
+
+func (e *engine) refreshScreen() {
+	s := screen()
+	w, h := int32(s.W), int32(s.H)
+	if w <= 0 || h <= 0 {
+		return
+	}
+	e.mu.Lock()
+	changed := e.scrW != w || e.scrH != h
+	e.scrW, e.scrH = w, h
+	e.mu.Unlock()
+	if changed {
+		log.Printf("mac screen updated: %dx%d", w, h)
+		e.send(protocol.MsgScreen, protocol.EncodeScreen(w, h))
+	}
 }
 
 // clientConnected reports whether a client is attached.
@@ -268,12 +311,19 @@ func modeName(m Mode) string {
 func (e *engine) run() {
 	go e.writer()
 
-	s := screen()
-	e.scrW, e.scrH = int32(s.W), int32(s.H)
-	log.Printf("mac screen: %dx%d", e.scrW, e.scrH)
+	e.refreshScreen()
+	go e.screenLoop()
 
 	go e.clipboardLoop()
 	go e.stickyDwellLoop()
+}
+
+func (e *engine) screenLoop() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for range t.C {
+		e.refreshScreen()
+	}
 }
 
 // stickyDwellLoop drives the sticky-edge visual and timing: it refreshes the
@@ -284,7 +334,9 @@ func (e *engine) stickyDwellLoop() {
 	t := time.NewTicker(40 * time.Millisecond)
 	defer t.Stop()
 	for range t.C {
+		e.stateMu.Lock()
 		if e.isRemote() || !e.sticky {
+			e.stateMu.Unlock()
 			continue
 		}
 		x, _ := mousePos()
@@ -294,8 +346,9 @@ func (e *engine) stickyDwellLoop() {
 			e.onEdgeUI(true, stickyBarLen(c))
 		}
 		if time.Since(e.stickyAt) >= e.stickyDwell(c) {
-			e.breakFree()
+			e.breakFreeLocked()
 		}
+		e.stateMu.Unlock()
 	}
 }
 
@@ -350,6 +403,9 @@ func (e *engine) consume(ev rawEvent) bool {
 // watchLocal: input applies to the Mac; watch for edge/hotkey switches.
 // Returns true if the event was consumed by a switch.
 func (e *engine) watchLocal(ev rawEvent) bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+
 	// Track held keys for hotkey detection.
 	switch ev.ctype {
 	case cgEventKeyDown:
@@ -357,14 +413,23 @@ func (e *engine) watchLocal(ev rawEvent) bool {
 	case cgEventKeyUp:
 		delete(e.keysDown, int(ev.keycode))
 	case cgEventFlagsChanged:
-		down := ev.flags&flagForMacKey(int(ev.keycode)) != 0
-		if down {
-			e.keysDown[int(ev.keycode)] = true
-		} else {
-			delete(e.keysDown, int(ev.keycode))
+		if int(ev.keycode) != 0x39 {
+			down := e.modifierDown(int(ev.keycode), ev.flags)
+			if down {
+				e.keysDown[int(ev.keycode)] = true
+			} else {
+				delete(e.keysDown, int(ev.keycode))
+			}
 		}
+	case cgEventLeftMouseDown, cgEventRightMouseDown, cgEventOtherMouseDown:
+		e.buttonsDown[int(ev.button)] = true
+	case cgEventLeftMouseUp, cgEventRightMouseUp, cgEventOtherMouseUp:
+		delete(e.buttonsDown, int(ev.button))
 	}
 	e.afterKeysUpdate()
+	if e.finishPendingRemote() {
+		return false
+	}
 
 	// Edge switch on mouse move: reaching the shared edge enters the "sticky"
 	// state (cursor held at the seam with visual feedback); the switch to
@@ -394,8 +459,7 @@ func (e *engine) watchLocal(ev rawEvent) bool {
 					e.stickyPush -= ev.dx
 				}
 				if e.stickyPush >= e.cfg.StickyPush {
-					e.breakFree()
-					return true
+					return e.breakFreeLocked()
 				}
 			}
 		} else {
@@ -415,26 +479,53 @@ func (e *engine) watchLocal(ev rawEvent) bool {
 	// Hotkey toggle.
 	if e.hotkeyDown() {
 		e.hotkeyLocked = true
-		e.enterRemote()
+		e.pendingRemote = true
 		return true
 	}
 	return false
 }
 
 // breakFree leaves the sticky state and switches control to the remote machine.
-func (e *engine) breakFree() {
+func (e *engine) breakFree() bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.breakFreeLocked()
+}
+
+func (e *engine) breakFreeLocked() bool {
 	if !e.sticky {
-		return
+		return false
 	}
 	e.sticky = false
 	if e.onEdgeUI != nil {
 		e.onEdgeUI(false, 0)
 	}
-	e.enterRemote()
+	if e.localInputHeld() {
+		e.pendingRemote = true
+		return false
+	}
+	e.enterRemoteLocked()
+	return true
+}
+
+func (e *engine) localInputHeld() bool {
+	return len(e.keysDown) > 0 || len(e.buttonsDown) > 0
+}
+
+func (e *engine) finishPendingRemote() bool {
+	if !e.pendingRemote || e.localInputHeld() {
+		return false
+	}
+	e.pendingRemote = false
+	e.enterRemoteLocked()
+	return true
 }
 
 // forwardRemote forwards input to the client.
 func (e *engine) forwardRemote(ev rawEvent) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+
 	// Hotkey while remote returns control to the Mac. We check it only on
 	// press events (not on key-up), and only after recording the press, so that
 	// the key-up that follows an enter-remote/leave-remote does not bounce
@@ -445,7 +536,7 @@ func (e *engine) forwardRemote(ev rawEvent) {
 		e.keysDown[int(ev.keycode)] = true
 		if e.hotkeyDown() {
 			e.hotkeyLocked = true
-			e.leaveRemote(-1)
+			e.leaveRemoteLocked(-1)
 			return
 		}
 		e.afterKeysUpdate()
@@ -459,12 +550,19 @@ func (e *engine) forwardRemote(ev rawEvent) {
 			e.send(protocol.MsgKey, protocol.EncodeKey(code, 0))
 		}
 	case cgEventFlagsChanged:
-		down := ev.flags&flagForMacKey(int(ev.keycode)) != 0
+		if int(ev.keycode) == 0x39 {
+			if code, ok := keymapToEvdev(int(ev.keycode)); ok {
+				e.send(protocol.MsgKey, protocol.EncodeKey(code, 1))
+				e.send(protocol.MsgKey, protocol.EncodeKey(code, 0))
+			}
+			return
+		}
+		down := e.modifierDown(int(ev.keycode), ev.flags)
 		if down {
 			e.keysDown[int(ev.keycode)] = true
 			if e.hotkeyDown() {
 				e.hotkeyLocked = true
-				e.leaveRemote(-1)
+				e.leaveRemoteLocked(-1)
 				return
 			}
 		} else {
@@ -491,6 +589,15 @@ func (e *engine) forwardRemote(ev rawEvent) {
 	}
 }
 
+func (e *engine) modifierDown(keycode int, flags uint64) bool {
+	switch keycode {
+	case 0x36, 0x37, 0x38, 0x3C, 0x3A, 0x3D, 0x3B, 0x3E:
+		return !e.keysDown[keycode]
+	default:
+		return flags&flagForMacKey(keycode) != 0
+	}
+}
+
 func (e *engine) sendMouseButton(btn, pressed uint8) {
 	e.send(protocol.MsgMouseButton, protocol.EncodeMouseButton(btn, pressed))
 }
@@ -504,6 +611,12 @@ func u8(b bool) uint8 {
 
 // enterRemote switches control to the client and parks the cursor.
 func (e *engine) enterRemote() {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.enterRemoteLocked()
+}
+
+func (e *engine) enterRemoteLocked() {
 	if e.isRemote() {
 		return
 	}
@@ -512,7 +625,11 @@ func (e *engine) enterRemote() {
 	_, y := mousePos()
 	// Tell the client where the Mac cursor was on the seam so it can land at
 	// the same Y (proportionally mapped) instead of a fixed park point.
-	e.send(protocol.MsgSwitch, []byte(fmt.Sprintf("remote:%d", int(y))))
+	e.send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
+		Direction: protocol.SwitchRemote,
+		Y:         int32(y),
+		HasY:      true,
+	}))
 	// Stop the physical mouse from driving the Mac cursor and hide it.
 	if setMouseAssoc != nil {
 		setMouseAssoc(false)
@@ -539,11 +656,19 @@ func (e *engine) enterRemote() {
 // edgeY is the client-side Y the cursor was at on the remote edge (from the
 // "back:Y" switch request), or -1 to use the current Mac cursor Y.
 func (e *engine) leaveRemote(edgeY float64) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.leaveRemoteLocked(edgeY)
+}
+
+func (e *engine) leaveRemoteLocked(edgeY float64) {
 	if !e.isRemote() {
 		return
 	}
 	e.switchTo(ModeLocal)
-	e.send(protocol.MsgSwitch, []byte("back"))
+	e.send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
+		Direction: protocol.SwitchBack,
+	}))
 	e.edgeArmed = false // cursor will be warped onto the edge; require it to leave first
 	// Re-associate the mouse with the cursor and show it again.
 	if setMouseAssoc != nil {
@@ -566,39 +691,35 @@ func (e *engine) leaveRemote(edgeY float64) {
 	}
 }
 
-// handleSwitchRequest processes a client request to return control. Payload is
-// "back" or "back:<client-edge-y>".
+// handleSwitchRequest processes a validated client request to return control.
 func (e *engine) handleSwitchRequest(payload []byte) {
-	s := string(payload)
-	if s != "back" && !strings.HasPrefix(s, "back:") {
+	message, err := protocol.DecodeSwitch(payload)
+	if err != nil || message.Direction != protocol.SwitchBack {
 		return
 	}
 	edgeY := -1.0
-	if i := strings.IndexByte(s, ':'); i >= 0 {
-		if v, err := strconv.ParseFloat(s[i+1:], 64); err == nil {
-			edgeY = v
-		}
+	if message.HasY {
+		edgeY = float64(message.Y)
 	}
 	e.leaveRemote(edgeY)
 }
 
-// mapMacYToClient maps a Mac cursor Y to the client's screen Y by proportion.
-func (e *engine) mapMacYToClient(y float64) float64 {
-	if e.cliH > 0 && e.scrH > 0 {
-		return y * float64(e.cliH) / float64(e.scrH)
-	}
-	return y
-}
-
 // mapClientYToMac maps a client-screen Y back to the Mac's screen Y.
 func (e *engine) mapClientYToMac(y float64) float64 {
-	if e.cliH > 0 && e.scrH > 0 {
-		return y * float64(e.scrH) / float64(e.cliH)
+	e.mu.Lock()
+	cliH, scrH := e.cliH, e.scrH
+	e.mu.Unlock()
+	if cliH > 0 && scrH > 0 {
+		return y * float64(scrH) / float64(cliH)
 	}
 	return y
 }
 
-func (e *engine) scrWf() float64 { return float64(e.scrW) }
+func (e *engine) scrWf() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return float64(e.scrW)
+}
 
 func (e *engine) atRemoteEdge(x float64) bool {
 	if e.remoteEdgeIsRight() {
@@ -639,40 +760,51 @@ func (e *engine) afterKeysUpdate() {
 
 // send enqueues a frame for the writer goroutine (non-blocking drop on full).
 func (e *engine) send(typ byte, payload []byte) {
+	e.mu.Lock()
+	c := e.conn
+	e.mu.Unlock()
+	if c == nil {
+		return
+	}
 	select {
-	case e.sendQ <- frameOut{typ: typ, payload: payload}:
+	case e.sendQ <- frameOut{typ: typ, payload: payload, conn: c}:
 	default:
-		log.Printf("warn: send queue full, dropping frame type=%d", typ)
+		log.Printf("warn: send queue full, closing client connection")
+		_ = c.Close()
 	}
 }
 
 // writer drains sendQ to the current client connection.
 func (e *engine) writer() {
 	for f := range e.sendQ {
-		e.mu.Lock()
-		c := e.conn
-		e.mu.Unlock()
-		if c == nil {
-			continue
-		}
-		if err := c.Send(f.typ, f.payload); err != nil {
+		if err := f.conn.Send(f.typ, f.payload); err != nil {
 			log.Printf("warn: send failed: %v", err)
+			e.dropConn(f.conn)
 		}
 	}
 }
 
 // recvLoop handles client->server messages on the connection's read side.
 // It runs on the connection goroutine; the channel closes on disconnect.
-func (e *engine) recvLoop(c netConn, frameCh <-chan protocol.Frame) {
-	for f := range frameCh {
+func (e *engine) recvLoop(r *bufio.Reader) {
+	for {
+		f, err := protocol.ReadFrame(r)
+		if err != nil {
+			return
+		}
 		switch f.Type {
 		case protocol.MsgClipboard:
 			e.applyClipboard(f.Payload)
 		case protocol.MsgSwitch:
 			e.handleSwitchRequest(f.Payload)
+		case protocol.MsgScreen:
+			w, h, err := protocol.DecodeScreen(f.Payload)
+			if err == nil && w > 0 && h > 0 {
+				e.setClientScreen(w, h)
+				log.Printf("client screen updated: %dx%d", w, h)
+			}
 		}
 	}
-	e.dropConn(c)
 }
 
 func clampY(y float64) float64 {

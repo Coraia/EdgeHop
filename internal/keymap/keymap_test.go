@@ -40,3 +40,25 @@ func TestUnknownKeyDropped(t *testing.T) {
 		t.Fatal("unknown keycode should be dropped")
 	}
 }
+
+func TestRightCommandAndExtendedFunctionKeys(t *testing.T) {
+	cases := []struct {
+		mac  int
+		ev   uint16
+		name string
+	}{
+		{0x36, 126, "RightCommand"},
+		{0x71, 185, "F15"},
+		{0x6A, 186, "F16"},
+		{0x40, 187, "F17"},
+		{0x4F, 188, "F18"},
+		{0x50, 189, "F19"},
+		{0x5A, 190, "F20"},
+	}
+	for _, c := range cases {
+		got, ok := ToEvdev(c.mac)
+		if !ok || got != c.ev {
+			t.Errorf("%s: got %d (ok=%v), want %d", c.name, got, ok, c.ev)
+		}
+	}
+}

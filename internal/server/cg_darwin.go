@@ -36,7 +36,7 @@ const (
 // that indicates it is currently pressed.
 func flagForMacKey(keycode int) uint64 {
 	switch keycode {
-	case 0x37: // Command
+	case 0x36, 0x37: // RightCommand / Command
 		return cgFlagCommand
 	case 0x38, 0x3C: // Shift / RightShift
 		return cgFlagShift

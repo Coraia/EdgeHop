@@ -1,11 +1,19 @@
 package client
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+	"universal_control/internal/secureconn"
+)
 
 // Config configures the Linux client.
 type Config struct {
 	// ServerAddr is the Mac mini address, e.g. "192.168.1.10:24800".
 	ServerAddr string
+
+	// PairingSecret authenticates and encrypts the server connection.
+	PairingSecret []byte
 
 	// DeviceName is the uinput device name shown in Hyprland.
 	DeviceName string
@@ -37,4 +45,30 @@ func DefaultConfig() Config {
 		ClipInterval:     500 * time.Millisecond,
 		EdgePollInterval: 40 * time.Millisecond,
 	}
+}
+
+// Validate checks configuration before opening uinput or starting goroutines.
+func (c Config) Validate() error {
+	if c.ServerAddr == "" {
+		return errors.New("client: server address is required")
+	}
+	if err := secureconn.ValidateSecret(c.PairingSecret); err != nil {
+		return fmt.Errorf("client: %w", err)
+	}
+	if c.DeviceName == "" {
+		return errors.New("client: device name is required")
+	}
+	if c.Edge != "left" && c.Edge != "right" {
+		return fmt.Errorf("client: invalid edge %q", c.Edge)
+	}
+	if c.EdgeMargin <= 0 {
+		return errors.New("client: edge margin must be positive")
+	}
+	if c.ClipInterval <= 0 {
+		return errors.New("client: clipboard interval must be positive")
+	}
+	if c.EdgePollInterval <= 0 {
+		return errors.New("client: edge poll interval must be positive")
+	}
+	return nil
 }
