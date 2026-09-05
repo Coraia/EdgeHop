@@ -4,10 +4,10 @@ package client
 
 import (
 	"bufio"
+	"github.com/Coraia/EdgeHop/internal/protocol"
 	"net"
 	"testing"
 	"time"
-	"universal_control/internal/protocol"
 )
 
 func TestInputFramesAreInjectedOnlyWhileRemote(t *testing.T) {
@@ -72,6 +72,20 @@ func TestScreenGeometryRecoversWhenSessionAppears(t *testing.T) {
 		t.Fatalf("screen refresh = %dx%d, want 1536x1728", w, h)
 	}
 	<-refreshDone
+}
+
+func TestClientAppliesServerSelectedEdge(t *testing.T) {
+	c := &Client{}
+	c.edge.Store(uint32(protocol.EdgeRight))
+
+	c.handle(protocol.Frame{
+		Type:    protocol.MsgClientEdge,
+		Payload: protocol.EncodeClientEdge(protocol.EdgeLeft),
+	})
+
+	if got := c.currentClientEdge(); got != protocol.EdgeLeft {
+		t.Fatalf("client edge = %d, want left", got)
+	}
 }
 
 type recordingInput struct {

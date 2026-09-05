@@ -10,12 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"universal_control/internal/clipsync"
-	"universal_control/internal/protocol"
-	"universal_control/internal/secureconn"
+
+	"github.com/Coraia/EdgeHop/internal/clipsync"
+	"github.com/Coraia/EdgeHop/internal/protocol"
+	"github.com/Coraia/EdgeHop/internal/secureconn"
 )
 
-// Client runs on the Omarchy machine. It connects to uc-server on the Mac,
+// Client runs on the Omarchy machine. It connects to EdgeHop on the Mac,
 // injects received input through uinput, and watches its own left edge to hand
 // control back.
 type Client struct {
@@ -24,6 +25,7 @@ type Client struct {
 	auth       *secureconn.Authenticator
 	screenSize func() (int, int, error)
 	remote     atomic.Bool
+	edge       atomic.Uint32
 	inputMu    sync.Mutex
 
 	scrW, scrH float64 // client screen size (set during handshake)
@@ -67,6 +69,11 @@ func New(cfg Config) (*Client, error) {
 		screenSize: hyprScreenSize,
 		stop:       make(chan struct{}),
 	}
+	edge, err := protocol.ParseEdge(cfg.Edge)
+	if err != nil {
+		edge = protocol.EdgeRight
+	}
+	c.edge.Store(uint32(edge))
 	return c, nil
 }
 
@@ -185,7 +192,7 @@ func (c *Client) runOnce() error {
 	c.w = w
 	c.macW, c.macH = float64(sw), float64(sh)
 	c.mu.Unlock()
-	log.Printf("connected to uc-server at %s (server screen %dx%d)", c.cfg.ServerAddr, sw, sh)
+	log.Printf("connected to EdgeHop at %s (server screen %dx%d)", c.cfg.ServerAddr, sw, sh)
 
 	for {
 		f, err := protocol.ReadFrame(r)
@@ -236,6 +243,12 @@ func (c *Client) handle(f protocol.Frame) {
 		}
 	case protocol.MsgClipboard:
 		c.applyClipboard(f.Payload)
+	case protocol.MsgClientEdge:
+		edge, err := protocol.DecodeClientEdge(f.Payload)
+		if err == nil {
+			c.edge.Store(uint32(edge))
+			log.Printf("device layout updated: shared client edge=%s", edge)
+		}
 	case protocol.MsgSwitch:
 		message, err := protocol.DecodeSwitch(f.Payload)
 		if err == nil {
@@ -316,7 +329,7 @@ func (c *Client) mapMacY(y float64) float64 {
 // PBP boundary without tripping the return detector.
 func (c *Client) parkX() float64 {
 	const inset = 24.0
-	if c.cfg.Edge == "left" {
+	if c.currentClientEdge() == protocol.EdgeLeft {
 		return inset
 	}
 	scrW, _, _, _ := c.screenGeometry()
@@ -379,9 +392,10 @@ func (c *Client) edgeWatch() {
 		if err != nil {
 			continue
 		}
+		edge := c.currentClientEdge()
 		atEdge := x <= c.cfg.EdgeMargin
 		scrW, _, _, _ := c.screenGeometry()
-		if c.cfg.Edge == "right" {
+		if edge == protocol.EdgeRight {
 			atEdge = x >= scrW-c.cfg.EdgeMargin
 		}
 		if atEdge {
@@ -390,7 +404,7 @@ func (c *Client) edgeWatch() {
 				continue
 			}
 			if time.Since(inZoneSince) >= dwell {
-				log.Printf("edge dwell: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, scrW, c.cfg.EdgeMargin, c.cfg.Edge)
+				log.Printf("edge dwell: x=%.0f (scrW=%.0f margin=%.0f edge=%s)", x, scrW, c.cfg.EdgeMargin, edge)
 				// Tell the server where we crossed so the Mac cursor lands at
 				// the same Y (proportionally) instead of a fixed park point.
 				_, y, errY := hyprCursorPos()
@@ -442,6 +456,14 @@ func (c *Client) refreshScreen() {
 		c.send(protocol.MsgScreen, protocol.EncodeScreen(int32(w), int32(h)))
 		log.Printf("screen geometry updated: %dx%d", w, h)
 	}
+}
+
+func (c *Client) currentClientEdge() protocol.Edge {
+	edge := protocol.Edge(c.edge.Load())
+	if edge != protocol.EdgeLeft && edge != protocol.EdgeRight {
+		return protocol.EdgeRight
+	}
+	return edge
 }
 
 func (c *Client) screenGeometry() (scrW, scrH, macW, macH float64) {

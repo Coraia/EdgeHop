@@ -73,7 +73,7 @@ Mac 键鼠无法在该界面输入密码；只能临时找物理键盘输入。�
 - Omarchy 根分区为 **LUKS 全盘加密**（`/dev/nvme1n1p2` → `crypto_LUKS` →
   btrfs `/`），由内核 cmdline `cryptdevice=PARTUUID=...:root` + mkinitcpio
   **`encrypt` hook** + Plymouth 处理，开机 initramfs 阶段提示输入解密密码。
-- 该界面发生在**根分区解锁之前**，uc-client 二进制位于加密根盘内，此阶段
+- 该界面发生在**根分区解锁之前**，EdgeHop 客户端二进制位于加密根盘内，此阶段
   **不可执行**，Mac 端 server 因 `clientConnected=false` 也拒绝边缘切换。
   → **此阶段 Mac 键鼠在架构上无法控制，非自启动/网络配置问题。**
 - 关联事实：开机 initramfs 阶段网络同样未就绪（NetworkManager 在根解锁后
@@ -83,7 +83,7 @@ Mac 键鼠无法在该界面输入密码；只能临时找物理键盘输入。�
 
 ### 已尝试方案 / 已验证事实
 
-1. **systemd 服务自启（uc-client.service，multi-user.target）**：已部署，
+1. **systemd 服务自启（edgehop-client.service，multi-user.target）**：已部署，
    登录后/网络就绪后正常，但**无法覆盖 initramfs 阶段**（根未解锁二进制不可用）。
 2. SDDM greeter 为 Wayland（`/etc/sddm.conf.d/10-wayland.conf`），libinput
    动态识别 uinput 设备 → **一旦越过 LUKS，SDDM 阶段注入大概率可用**（未最终验证）。
@@ -94,7 +94,7 @@ Mac 键鼠无法在该界面输入密码；只能临时找物理键盘输入。�
 
 - **LUKS keyfile 自动解锁（推荐）**：生成随机 keyfile 放 `/boot`，
   `cryptsetup luksAddKey` 新增密钥槽 + 内核 cmdline 加 `cryptkey=/boot/<key>`
-  → 开机免解密密码，直达 SDDM 登录界面，随后 uc-client 早期运行、Mac 键鼠可输密码。
+  → 开机免解密密码，直达 SDDM 登录界面，随后 EdgeHop 客户端早期运行、Mac 键鼠可输密码。
   保留全盘加密；原密码槽保留，可逆。
 - **移除 LUKS 加密**：彻底去掉开机密码，但需解密迁移、安全降级，风险高。
 - **接受现状**：每次开机物理键盘输解密密码。

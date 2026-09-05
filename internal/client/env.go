@@ -9,7 +9,7 @@ import (
 
 // ensureHyprEnv sets HYPRLAND_INSTANCE_SIGNATURE (and XDG_RUNTIME_DIR) from the
 // running Hyprland instance socket when they are not already set. This lets a
-// systemd-launched uc-client (started at boot, before login) pick up the
+// systemd-launched EdgeHop client (started at boot, before login) pick up the
 // Hyprland IPC connection once the user has logged in — without a restart — so
 // hyprctl-based screen size / cursor edge detection keep working across the
 // login boundary. Returns true when a usable instance is available.
@@ -36,7 +36,7 @@ func ensureHyprEnv() bool {
 
 // ensureWaylandEnv sets WAYLAND_DISPLAY (and XDG_RUNTIME_DIR) from the first
 // available wayland socket when not already set, so wl-clipboard works for a
-// systemd-launched uc-client that did not inherit the session environment.
+// systemd-launched EdgeHop client that did not inherit the session environment.
 func ensureWaylandEnv() {
 	runtimeDir := ensureRuntimeDir()
 	if display := os.Getenv("WAYLAND_DISPLAY"); display != "" &&

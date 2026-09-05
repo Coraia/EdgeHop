@@ -4,7 +4,8 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"universal_control/internal/protocol"
+
+	"github.com/Coraia/EdgeHop/internal/protocol"
 )
 
 func TestDisconnectRestoresLocalPointerAssociation(t *testing.T) {
@@ -214,6 +215,35 @@ func TestScreenRefreshUpdatesEdgeGeometry(t *testing.T) {
 
 	if e.sticky {
 		t.Fatal("old display edge remained active after geometry changed")
+	}
+}
+
+func TestRemoteEdgeUpdateChangesSeamAndNotifiesClient(t *testing.T) {
+	restorePlatform := installTestPlatform()
+	defer restorePlatform()
+
+	e := newEngine(DefaultConfig())
+	conn := &recordingConn{}
+	e.setConn(conn)
+	go e.writer()
+
+	if err := e.setRemoteEdge(EdgeLeft); err != nil {
+		t.Fatalf("setRemoteEdge: %v", err)
+	}
+	if e.remoteEdgeIsRight() {
+		t.Fatal("remote edge remained right after update")
+	}
+
+	frames := conn.waitForFrames(t, 1)
+	if frames[0].typ != protocol.MsgClientEdge {
+		t.Fatalf("frame type = %d, want MsgClientEdge", frames[0].typ)
+	}
+	edge, err := protocol.DecodeClientEdge(frames[0].payload)
+	if err != nil {
+		t.Fatalf("DecodeClientEdge: %v", err)
+	}
+	if edge != protocol.EdgeRight {
+		t.Fatalf("client edge = %d, want right", edge)
 	}
 }
 

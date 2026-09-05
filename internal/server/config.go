@@ -3,8 +3,8 @@ package server
 import (
 	"errors"
 	"fmt"
+	"github.com/Coraia/EdgeHop/internal/secureconn"
 	"time"
-	"universal_control/internal/secureconn"
 )
 
 // Config configures the macOS server.
@@ -19,6 +19,10 @@ type Config struct {
 	// "right" means the Omarchy screen sits to the right (PBP layout with
 	// Mac on the left), "left" means it sits to the left.
 	RemoteEdge string
+
+	// RemoteEdgeUpdates optionally supplies runtime layout changes. The Mac is
+	// authoritative and sends the opposite shared edge to the client.
+	RemoteEdgeUpdates <-chan string
 
 	// SwitchKeys is an optional hotkey (list of macOS virtual keycodes that
 	// must be held together) to toggle remote control without reaching an

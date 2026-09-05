@@ -157,7 +157,7 @@ func authenticateClient(conn *tls.Conn, secret []byte) error {
 
 func channelBinding(conn *tls.Conn) ([]byte, error) {
 	state := conn.ConnectionState()
-	binding, err := state.ExportKeyingMaterial("universal-control/2", nil, 32)
+	binding, err := state.ExportKeyingMaterial("edgehop/1", nil, 32)
 	if err != nil {
 		return nil, fmt.Errorf("secureconn: channel binding: %w", err)
 	}
@@ -184,7 +184,7 @@ func generateCertificate() (tls.Certificate, error) {
 	now := time.Now()
 	template := x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "universal-control ephemeral"},
+		Subject:      pkix.Name{CommonName: "EdgeHop ephemeral"},
 		NotBefore:    now.Add(-time.Minute),
 		NotAfter:     now.Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

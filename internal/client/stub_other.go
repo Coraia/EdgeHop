@@ -11,7 +11,7 @@ type Client struct{}
 
 // New returns an error: the client only builds for Linux.
 func New(cfg Config) (*Client, error) {
-	return nil, errors.New("uc-client only builds for linux (use the Omarchy machine)")
+	return nil, errors.New("edgehop-client only builds for Linux")
 }
 
 // Close is a no-op stub.
@@ -19,5 +19,5 @@ func (c *Client) Close() error { return nil }
 
 // Run always fails on non-Linux.
 func (c *Client) Run() error {
-	return errors.New("uc-client only builds for linux (use the Omarchy machine)")
+	return errors.New("edgehop-client only builds for Linux")
 }

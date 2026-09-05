@@ -13,6 +13,7 @@ func TestRoundTripAllMessages(t *testing.T) {
 	}{
 		{MsgHello, []byte(Version)},
 		{MsgScreen, EncodeScreen(1920, 1080)},
+		{MsgClientEdge, EncodeClientEdge(EdgeRight)},
 		{MsgMouseMove, EncodeMouseMove(-12, 34)},
 		{MsgMouseAbs, EncodeMouseAbs(1880, 540)},
 		{MsgMouseButton, EncodeMouseButton(ButtonLeft, 1)},
@@ -42,6 +43,24 @@ func TestRoundTripAllMessages(t *testing.T) {
 	}
 	if _, err := ReadFrame(r); err == nil {
 		t.Fatal("expected EOF after all frames")
+	}
+}
+
+func TestClientEdgeRoundTripAndValidation(t *testing.T) {
+	for _, want := range []Edge{EdgeLeft, EdgeRight} {
+		got, err := DecodeClientEdge(EncodeClientEdge(want))
+		if err != nil {
+			t.Fatalf("DecodeClientEdge(%d): %v", want, err)
+		}
+		if got != want {
+			t.Fatalf("client edge = %d, want %d", got, want)
+		}
+	}
+
+	for _, payload := range [][]byte{nil, {0}, {3}, {1, 2}} {
+		if _, err := DecodeClientEdge(payload); err == nil {
+			t.Fatalf("DecodeClientEdge(%v) accepted malformed payload", payload)
+		}
 	}
 }
 

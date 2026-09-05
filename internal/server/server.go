@@ -7,8 +7,9 @@ import (
 	"log"
 	"net"
 	"time"
-	"universal_control/internal/protocol"
-	"universal_control/internal/secureconn"
+
+	"github.com/Coraia/EdgeHop/internal/protocol"
+	"github.com/Coraia/EdgeHop/internal/secureconn"
 )
 
 // Run starts the macOS server: the event tap, the engine, and the network
@@ -31,7 +32,7 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 	initDisplay()
 	e := newEngine(cfg)
 	e.onEdgeUI = func(on bool, barLen float64) {
-		setStickyOverlay(on, barLen, cfg.RemoteEdge == EdgeRight)
+		setStickyOverlay(on, barLen, e.remoteEdgeIsRight())
 	}
 	if onStatus != nil {
 		e.setOnStatus(onStatus)
@@ -60,6 +61,15 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 
 	// Engine drives modes/clipboard.
 	go e.run()
+	if cfg.RemoteEdgeUpdates != nil {
+		go func() {
+			for edge := range cfg.RemoteEdgeUpdates {
+				if err := e.setRemoteEdge(edge); err != nil {
+					e.reportError(err)
+				}
+			}
+		}()
+	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -69,7 +79,7 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 		s.ServerRunning = true
 		s.LastError = ""
 	})
-	log.Printf("uc-server listening on %s (remote edge: %s)", cfg.ListenAddr, cfg.RemoteEdge)
+	log.Printf("EdgeHop listening on %s (client on Mac %s)", cfg.ListenAddr, cfg.RemoteEdge)
 	log.Printf("grant Accessibility permission if prompted; set remote edge to %q if Omarchy sits on the left", cfg.RemoteEdge)
 
 	for {
@@ -127,6 +137,10 @@ func (e *engine) handleConn(c net.Conn) {
 		return
 	}
 	if err := cc.Send(protocol.MsgScreen, protocol.EncodeScreen(int32(sc.W), int32(sc.H))); err != nil {
+		c.Close()
+		return
+	}
+	if err := cc.Send(protocol.MsgClientEdge, protocol.EncodeClientEdge(e.clientEdge())); err != nil {
 		c.Close()
 		return
 	}

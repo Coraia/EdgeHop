@@ -1,5 +1,5 @@
-// Package protocol defines the wire protocol shared by uc-server (macOS)
-// and uc-client (Linux). Messages are framed as:
+// Package protocol defines the wire protocol shared by EdgeHop on macOS and
+// Linux. Messages are framed as:
 //
 //	[4-byte big-endian payload length][1-byte type][payload]
 //
@@ -18,7 +18,7 @@ import (
 const MaxFrameSize = 1 << 20 // 1 MiB
 
 // Version is exchanged after the secure transport is established.
-const Version = "universal-control/2"
+const Version = "edgehop/1"
 
 // ErrFrameTooLarge is returned when a frame exceeds MaxFrameSize.
 var ErrFrameTooLarge = errors.New("protocol: frame too large")
@@ -29,6 +29,8 @@ const (
 	MsgHello byte = 0x01
 	// MsgScreen: server -> client screen geometry (w:int32, h:int32).
 	MsgScreen byte = 0x02
+	// MsgClientEdge: server -> client shared edge encoded by EncodeClientEdge.
+	MsgClientEdge byte = 0x03
 	// MsgMouseMove: server -> client relative move (dx:int16, dy:int16).
 	MsgMouseMove byte = 0x10
 	// MsgMouseAbs: server -> client absolute position (x:int32, y:int32).
@@ -99,6 +101,55 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 }
 
 // --- Payload builders/parsers ---------------------------------------------
+
+// Edge identifies a horizontal display edge.
+type Edge uint8
+
+const (
+	EdgeLeft  Edge = 1
+	EdgeRight Edge = 2
+)
+
+// ParseEdge converts a lowercase edge name ("left"/"right") to its enum value.
+func ParseEdge(s string) (Edge, error) {
+	switch s {
+	case "left":
+		return EdgeLeft, nil
+	case "right":
+		return EdgeRight, nil
+	default:
+		return 0, errors.New("protocol: invalid edge name")
+	}
+}
+
+// String returns the lowercase name of an edge.
+func (e Edge) String() string {
+	switch e {
+	case EdgeLeft:
+		return "left"
+	case EdgeRight:
+		return "right"
+	default:
+		return "unknown"
+	}
+}
+
+// EncodeClientEdge builds a MsgClientEdge payload.
+func EncodeClientEdge(edge Edge) []byte {
+	return []byte{byte(edge)}
+}
+
+// DecodeClientEdge parses and validates a MsgClientEdge payload.
+func DecodeClientEdge(payload []byte) (Edge, error) {
+	if len(payload) != 1 {
+		return 0, errors.New("protocol: invalid client edge payload size")
+	}
+	edge := Edge(payload[0])
+	if edge != EdgeLeft && edge != EdgeRight {
+		return 0, errors.New("protocol: invalid client edge")
+	}
+	return edge, nil
+}
 
 // EncodeScreen builds a MsgScreen payload.
 func EncodeScreen(w, h int32) []byte {
@@ -257,6 +308,12 @@ func (f Frame) String() string {
 	case MsgScreen:
 		w, h, _ := DecodeScreen(f.Payload)
 		return fmt.Sprintf("Screen(%dx%d)", w, h)
+	case MsgClientEdge:
+		edge, err := DecodeClientEdge(f.Payload)
+		if err != nil {
+			return "ClientEdge(invalid)"
+		}
+		return fmt.Sprintf("ClientEdge(%d)", edge)
 	case MsgMouseMove:
 		dx, dy, _ := DecodeMouseMove(f.Payload)
 		return fmt.Sprintf("MouseMove(%d,%d)", dx, dy)

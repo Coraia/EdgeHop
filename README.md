@@ -1,220 +1,141 @@
-# universal_control
+<p align="center">
+  <img src="assets/edgehop-app-icon.png" width="180" alt="EdgeHop icon">
+</p>
 
-让 **Mac mini 的触控板和键盘控制 Omarchy 台式机**（Linux / Arch + Hyprland / Wayland），并在两台电脑间**双向同步剪贴板**——一个软件级 KVM（Keyboard-Video-Mouse over LAN）。
+# EdgeHop
 
-配合两台机器共用的 PBP（画中画/双画面）显示器：**Omarchy 在左半屏、Mac mini 在右半屏**，鼠标移到两台屏幕之间的边缘即可"穿越"切换，就像在用一台电脑。
+[![CI](https://github.com/Coraia/EdgeHop/actions/workflows/ci.yml/badge.svg)](https://github.com/Coraia/EdgeHop/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+EdgeHop 是一款开源软件 KVM：使用 Mac 的键盘、鼠标或触控板控制
+Omarchy/Hyprland 设备，并在两端同步剪贴板。把指针推过共享边缘即可切换，
+不要求显示器支持 PBP，两台电脑各接一块独立显示器也可以使用。
 
-```
-┌───────────────┬───────────────┐
-│    Omarchy    │   Mac mini    │  ← 同一台显示器 PBP 分屏
-│  (左半屏)      │  (右半屏)      │
-│  Linux/Arch   │  物理键鼠在这边  │
-└───────┬───────┴───────┬───────┘
-        │  局域网 TCP    │
-  uc-client          uc-server
-  (/dev/uinput + wl-clipboard)   (CGEventTap)
-```
+## 当前支持范围
 
-## 功能特性
+| 角色 | 支持平台 |
+|---|---|
+| 主机 | macOS 26、Apple Silicon |
+| 客户端 | Omarchy/Arch Linux、Hyprland/Wayland、amd64 或 arm64 |
+| 拓扑 | 两台设备、左右排列、单屏正式支持 |
+| 网络 | 两台设备网络互通，默认 TCP `24800` |
 
-- **边缘穿越**：鼠标推到屏幕边缘，带"粘住 → 挣脱"的苹果风视觉反馈（全高 2px 亮线 + 柔和光晕，随贴近收窄），进入/退出时 Y 坐标按屏高比例平移，光标出现在对端对应位置而非固定点。
-- **热键切换**：默认 **⌘⇧空格** 在任意一侧、任意位置手动切换控制权。
-- **剪贴板同步**：纯文本双向复制粘贴（Mac `pbpaste`/`pbcopy` ↔ Linux `wl-copy`/`wl-paste`）。
-- **登录界面可用**：Linux 端以 systemd 服务自启，SDDM greeter 阶段即可被 Mac 键鼠控制（受 LUKS 加密盘限制，见[已知问题](docs/known-issues.md)）。
+多显示器桌面目前为实验性能力。Mac 端只跟踪主显示器，Hyprland 端只读取
+第一台显示器；详细边界见 [已知问题](docs/known-issues.md)。
 
-## 工作原理
+## 功能
 
-- **uc-server**（跑在 Mac mini）：通过 macOS `CGEventTap` 全局捕获触控板/键盘事件。
-  - 本地模式：事件正常作用于 Mac；
-  - 光标到达 Mac **左边缘**（Omarchy 在 Mac 左侧）或按下热键 → 进入远程模式，事件被抑制并转发给 Omarchy；
-  - 剪贴板通过 `pbpaste`/`pbcopy` 轮询同步。
-- **uc-client**（跑在 Omarchy）：纯 Go 直写 `/dev/uinput` 注入键鼠事件（免 cgo、免 ydotool 守护进程），用 `wl-copy`/`wl-paste` 同步剪贴板；通过 `hyprctl cursorpos` 检测光标到 Omarchy **右边缘**，请求切回 Mac。
-  - **环境自动探测**：缺失 `HYPRLAND_INSTANCE_SIGNATURE` / `WAYLAND_DISPLAY` 时自动从 `/run/user/<uid>/hypr` 与 `wayland-*` socket 探测，因此可由 systemd 在登录前启动、登录后无缝接管，无需重启。
-- 协议：TLS 1.3 加密通道 + 随机共享配对密钥，内部使用长度前缀二进制帧（鼠标移动/点击/滚轮/键盘/剪贴板/切换），端口默认 `24800`。
+- TLS 1.3 加密连接和随机共享配对密钥
+- 键盘、鼠标、滚轮和剪贴板双向协作
+- 贴边停留与“挣脱”交互，减少误切换
+- 切换时按屏幕高度比例保持指针位置
+- 菜单栏实时状态和配对码复制
+- 菜单中选择“客户端在 Mac 左侧/右侧”
+- Mac 作为布局单一事实源，自动同步相反返回边缘给 Linux 客户端
+- Omarchy systemd 开机自启和旧版本自动迁移
 
-## 构建
+## 安装
 
-在 Mac mini 上（已装 Go 1.2x）：
+### 1. macOS
+
+从 [Releases](https://github.com/Coraia/EdgeHop/releases) 下载：
+
+`EdgeHop-macos26-arm64.dmg`
+
+1. 打开 DMG，把 `EdgeHop.app` 拖入 `/Applications`。
+2. 当前公开包采用 ad-hoc 签名且未做 Apple 公证。首次启动如被拦截，请在
+   Finder 中右键应用并选择“打开”。
+3. 在“系统设置 → 隐私与安全性 → 辅助功能”中启用 EdgeHop。
+4. 从菜单栏选择“复制配对码”。
+
+首次启动会创建：
+
+- 配对密钥：`~/Library/Application Support/edgehop/pairing.key`
+- 布局配置：`~/Library/Application Support/edgehop/config.json`
+- 日志：`~/Library/Logs/EdgeHop.log`
+
+从旧版 Universal Control 升级时，EdgeHop 会自动复制原配对密钥和配置。
+由于 ad-hoc 签名身份随构建变化，升级后 macOS 可能要求重新授予辅助功能权限。
+
+### 2. Omarchy
+
+下载 `edgehop-omarchy-install.tar.gz`，然后运行：
 
 ```bash
-make build          # 产出 bin/uc-server、bin/uc-client-linux-amd64、bin/uc-client-linux-arm64
-make bundle         # 生成 macOS 菜单栏应用 dist/universal-control.app
-make dmg            # 生成 macOS 26 arm64 安装镜像 dist/universal-control-macos26-arm64.dmg
-make omarchy-installer  # 生成 Omarchy 一键安装包 dist/omarchy-install.tar.gz
+tar xzf edgehop-omarchy-install.tar.gz
+cd edgehop-omarchy
+./setup-omarchy.sh -s <Mac-IP>
 ```
 
-## Mac mini 端部署（uc-server）
+在隐藏提示中粘贴 Mac 菜单复制的配对码。安装器会：
 
-### 方式 A：菜单栏应用（推荐，免开终端）
+- 安装所需依赖和 `/dev/uinput` 权限规则
+- 选择 amd64 或 arm64 客户端
+- 写入权限为 `0600` 的配对密钥
+- 创建并启动 `edgehop-client.service`
+- 迁移旧 `uc-client.service`、二进制和 Hyprland 设备配置
+
+查看状态：
 
 ```bash
+systemctl status edgehop-client
+journalctl -u edgehop-client -f
+```
+
+## 设备布局
+
+在 Mac 菜单栏打开“设备布局”，选择：
+
+- `客户端在 Mac 左侧`
+- `客户端在 Mac 右侧`
+
+选择会立即保存并同步到已连接客户端，不需要分别修改两端配置。
+
+## 从源码构建
+
+要求 Go 1.26 和 Xcode Command Line Tools。
+
+```bash
+make test
 make dmg
-open dist/universal-control-macos26-arm64.dmg
+make omarchy-installer
 ```
 
-- 将 **Universal Control.app** 拖入 Applications 后运行。当前安装包面向 **macOS 26 arm64**，采用本地签名、未做 Apple 公证，首次打开如被拦截，请在 Finder 中右键应用并选择“打开”；
-- 运行后右上角菜单栏出现 Universal Control 图标，服务器同进程自动启动；
-- **授予辅助功能（Accessibility）权限**：系统设置 → 隐私与安全性 → 辅助功能，勾选 `universal-control`。未授权时应用会静默等待，不再反复弹授权框；
-- 菜单可查看服务器/客户端/模式状态、复制配对码、打开辅助功能设置、打开日志（`~/Library/Logs/universal-control.log`）、勾选"登录时自动启动"（写入 LaunchAgent）、退出；
-- 应用为 `LSUIElement`，不占 Dock。
-- 首次启动会生成 `~/Library/Application Support/universal-control/pairing.key`（权限 `0600`）。在安装 Linux 客户端时粘贴菜单中的配对码；两端配对码不一致时连接会被拒绝。
-- **边缘方向配置**：写入 `~/Library/Application Support/universal-control/config.json`，默认布局（Omarchy 在左）为：
+产物：
 
-  ```json
-  {"edge": "left"}
-  ```
+- `dist/EdgeHop-macos26-arm64.dmg`
+- `dist/edgehop-omarchy-install.tar.gz`
 
-  命令行参数优先于配置文件。
-- **默认切换热键 ⌘⇧空格**：即使边缘检测未触发也能切回；可在 config.json 用 `"switchKeys": [55,56,49]` 覆盖（macOS 键码）。
-
-### 方式 B：命令行（开发/调试用）
+命令行入口：
 
 ```bash
-./bin/uc-server -listen 0.0.0.0:24800 -edge left
+go run ./cmd/edgehop-server -h
+go run ./cmd/edgehop-client -h
 ```
 
-同样需要给 `uc-server`（或终端 App）授予辅助功能权限。
+## 安全模型
 
-### uc-server 参数
+EdgeHop 不使用云端服务。双方通过用户复制的随机 256 位密钥完成认证，
+连接使用 TLS 1.3，并以 TLS 导出密钥材料绑定双方 HMAC 证明。配对密钥不会
+写入命令行参数、shell 历史或应用日志。
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `-listen` | `0.0.0.0:24800` | 监听地址 |
-| `-pairing-file` | Application Support 下的 `pairing.key` | 共享配对密钥文件；不存在时自动生成 |
-| `-edge` | `right` | Omarchy 在 Mac 的哪一侧：`right`/`left` |
-| `-edge-sensitivity` | `2.0` | 触发切换的边缘像素余量 |
-| `-switch-keys` | `55,56,49` | 手动切换热键的 macOS 键码，逗号分隔；显式传参会替换默认值 |
-| `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
+请勿公开上传本机配对密钥、配置或日志。
 
-## Omarchy 端部署（uc-client）
+## 已知限制
 
-**一键安装**：在 Mac 上执行 `make omarchy-installer` 生成 `dist/omarchy-install.tar.gz`，拷到 Omarchy 后：
+- macOS 系统级 Mission Control 手势无法通过 CGEventTap 完全拦截。
+- LUKS 根分区解锁前，Linux 客户端和网络尚不可用。
+- 完整多显示器拓扑管理尚未实现。
+- 当前 DMG 未使用 Developer ID 签名或 Apple 公证。
 
-```bash
-tar xzf omarchy-install.tar.gz && cd omarchy-install
-./setup-omarchy.sh -s <Mac mini 的IP>
-```
+更多信息见 [`docs/known-issues.md`](docs/known-issues.md)。
 
-按静默提示粘贴 Mac 菜单中复制的配对码。配对码不会出现在 shell 历史或进程参数中。
+## 贡献与安全
 
-脚本会自动完成：
-1. `pacman` 安装 `wl-clipboard`、`hyprland-utils`；
-2. 配置 `/dev/uinput` 访问（加入 `input` 组 + udev 规则）；
-3. 安装 `uc-client` 到 `/usr/local/bin`；
-4. 创建 **systemd 服务 `uc-client.service`**（`multi-user.target` 开机自启，覆盖登录界面），并写入 Hyprland 虚拟指针去加速配置。
+- 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
+- 安全问题：[`SECURITY.md`](SECURITY.md)
+- 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
-**手动安装**（等价步骤，供排查）：
+## License
 
-1. **安装依赖**（Arch）：
-
-   ```bash
-   sudo pacman -S --needed wl-clipboard hyprland-utils
-   ```
-
-2. **放行 uinput**（一次配置）：
-
-   ```bash
-   sudo usermod -aG input $USER
-   echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/99-universal-control.rules
-   sudo udevadm control --reload-rules && sudo udevadm trigger
-   # 重新登录使 input 组生效
-   ```
-
-3. **systemd 服务**（开机自启，覆盖登录界面；登录后仍由它管理，无需会话内拉起）：
-
-   ```bash
-   install -d -m 700 ~/.config/universal-control
-   printf '%s\n' '<Mac 菜单中复制的配对码>' > ~/.config/universal-control/pairing.key
-   chmod 600 ~/.config/universal-control/pairing.key
-   ```
-
-   ```ini
-   # /etc/systemd/system/uc-client.service
-   [Unit]
-   Description=Universal Control client (boot + login keyboard/mouse)
-   After=network.target
-
-   [Service]
-   Type=simple
-   User=$USER
-   ExecStart=/usr/local/bin/uc-client -server <Mac mini 的IP>:24800 -pairing-file %h/.config/universal-control/pairing.key -edge right
-   Restart=always
-   RestartSec=3
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
-
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now uc-client.service
-   journalctl -u uc-client -f   # 查看日志
-   ```
-
-4. **让虚拟指针平滑**：在 `~/.config/hypr/hyprland.conf` 中加：
-
-   ```ini
-   device {
-       name = universal-control
-       accel_profile = flat
-       sensitivity = 0
-   }
-   ```
-
-5. 参数：
-
-   | 参数 | 默认 | 说明 |
-   |---|---|---|
-   | `-server` | （必填） | Mac mini 地址，如 `192.168.1.10:24800` |
-   | `-pairing-file` | `~/.config/universal-control/pairing.key` | Mac 与 Linux 共用的配对密钥文件 |
-   | `-device` | `universal-control` | uinput 设备名（与 hyprland.conf 一致） |
-   | `-edge` | `right` | Omarchy 的哪一侧对着 Mac：`right`（Omarchy 在左）、`left`（Omarchy 在右） |
-   | `-edge-margin` | `8` | 边缘多少像素内触发切回 Mac（逻辑像素） |
-   | `-clip-interval` | `500ms` | 剪贴板轮询间隔 |
-   | `-edge-poll` | `40ms` | 光标位置轮询间隔 |
-
-   注意：Omarchy 的 `hyprctl cursorpos` 返回**逻辑坐标**（受显示器 scale 影响，如 1.25x 时 1920 物理宽 → 逻辑宽 1536）。客户端已按逻辑尺寸计算边缘，无需手动换算。
-
-## 使用
-
-- **Mac → Omarchy**：把鼠标移到 Mac 屏幕**左边缘**（Omarchy 在 Mac 左侧时）；键鼠随即控制 Omarchy，Mac 光标自动隐藏。
-- **Omarchy → Mac**：把鼠标移到 Omarchy 屏幕**右边缘**，控制权切回 Mac。
-- **热键切换**：按 **⌘⇧空格** 可在任意一侧、任意位置手动切换（默认开启）。
-- **剪贴板**：任一台上复制文本，另一台可直接粘贴（纯文本，双向）。
-
-## 视觉与交互（边缘穿越）
-
-参考苹果 Universal Control 的克制风格：光标贴近边缘时浮现**全高 2px 亮白线 + 柔和光晕**（随贴近收窄），随后需"粘住 → 挣脱"才进入对端，防止误触；进入/退出时 Y 坐标按屏高比例映射，光标出现在对端对应高度。全部参数可在 `internal/server/engine.go` / `config.go` 调整。
-
-## 已知问题
-
-见 [docs/known-issues.md](docs/known-issues.md)：
-
-- **Issue #1**：远程模式下三指上滑触发 Mac 的 Mission Control（macOS 系统手势，CGEventTap 无法拦截，等待业界方案）。
-- **Issue #2**：Omarchy 根分区为 LUKS 加密盘时，开机 LUKS 解密界面在 initramfs 阶段，uc-client 不可执行，Mac 键鼠无法在该阶段输密码（需物理键盘或配置 keyfile 自动解锁）。
-
-## 目录结构
-
-```
-cmd/uc-server/          macOS 端入口（命令行）
-cmd/uc-tray/            菜单栏应用入口（systray + 内嵌服务器）
-cmd/uc-client/          Linux 端入口
-internal/protocol/      网络协议（两端共用，含单测）
-internal/secureconn/    TLS 1.3 + 共享密钥双向认证（含单测）
-internal/clipsync/      剪贴板回声抑制状态（含单测）
-internal/keymap/        macOS 键码 → Linux evdev 键码（含单测）
-internal/server/        macOS 实现（CGEventTap、剪贴板、切换引擎、状态回调、边缘特效 overlay）
-internal/client/        Linux 实现（uinput 注入、wl-clipboard、边缘检测、环境自动探测）
-tools/genicon/          菜单栏模板图标生成器
-scripts/bundle-macos.sh .app 打包脚本（LSUIElement + ad-hoc 签名）
-scripts/make-macos-dmg.sh macOS 26 arm64 DMG 打包和校验脚本
-scripts/setup-omarchy.sh Omarchy 一键安装/自启脚本（systemd 服务）
-scripts/make-omarchy-installer.sh Omarchy 安装器 tar 打包
-docs/known-issues.md    已知问题登记
-```
-
-## 许可证
-
-[MIT](LICENSE)
+[MIT](LICENSE) © 2026 Coraia

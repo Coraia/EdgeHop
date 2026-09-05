@@ -2,10 +2,10 @@ package server
 
 import (
 	"bufio"
+	"github.com/Coraia/EdgeHop/internal/protocol"
 	"net"
 	"sync"
 	"time"
-	"universal_control/internal/protocol"
 )
 
 // clientConn is a netConn backed by a TCP socket. Writes are serialized and

@@ -2,7 +2,7 @@
 
 package server
 
-import "universal_control/internal/keymap"
+import "github.com/Coraia/EdgeHop/internal/keymap"
 
 // CGEventType values (CoreGraphics/CGEventTypes.h).
 const (

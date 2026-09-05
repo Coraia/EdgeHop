@@ -3,11 +3,11 @@
 package server
 
 import (
+	"github.com/Coraia/EdgeHop/internal/protocol"
 	"log"
 	"os/exec"
 	"strings"
 	"time"
-	"universal_control/internal/protocol"
 )
 
 // readClipboard returns the current text on the macOS clipboard.

@@ -1,4 +1,5 @@
-// uc-tray is the macOS menu-bar front end for uc-server. It runs the server
+// EdgeHop is the macOS menu-bar front end for the input-sharing server. It runs
+// the server
 // in-process (so a single Accessibility grant covers everything), shows status
 // in the menu bar, and needs no terminal.
 //
@@ -9,6 +10,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -19,32 +21,39 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/Coraia/EdgeHop/internal/secureconn"
+	"github.com/Coraia/EdgeHop/internal/server"
 	"github.com/getlantern/systray"
-	"universal_control/internal/secureconn"
-	"universal_control/internal/server"
 )
 
 //go:embed assets/menubar.png
 var menuIcon []byte
 
 const (
-	appLabel = "com.universalcontrol.app"
-	tooltip  = "Universal Control — Mac ⇄ Omarchy"
+	appLabel       = "io.coraia.edgehop"
+	legacyAppLabel = "com.universalcontrol.app"
+	tooltip        = "EdgeHop — Mac ⇄ Linux"
 )
 
-var logPath = filepath.Join(os.Getenv("HOME"), "Library", "Logs", "universal-control.log")
+var logPath = filepath.Join(os.Getenv("HOME"), "Library", "Logs", "EdgeHop.log")
+
+func appSupportDir() string {
+	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "edgehop")
+}
+
+func legacyAppSupportDir() string {
+	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "universal-control")
+}
 
 // configFilePath is an optional JSON config that overrides defaults so the app
 // can be configured without launching from a terminal. Fields: listen, edge,
 // connect.
 func configFilePath() string {
-	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support",
-		"universal-control", "config.json")
+	return filepath.Join(appSupportDir(), "config.json")
 }
 
 func pairingFilePath() string {
-	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support",
-		"universal-control", "pairing.key")
+	return filepath.Join(appSupportDir(), "pairing.key")
 }
 
 type fileConfig struct {
@@ -67,6 +76,12 @@ func main() {
 	flag.Parse()
 	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
+	// Log to file first so fatal migration errors are visible for a GUI launch.
+	setupLogging()
+	if err := migrateLegacyData(legacyAppSupportDir(), appSupportDir()); err != nil {
+		log.Fatalf("migrate legacy data: %v", err)
+	}
+
 	// Apply optional config file for flags not given on the command line.
 	switchKeys := defaultSwitchKeys
 	if fc, err := readFileConfig(); err == nil {
@@ -81,7 +96,11 @@ func main() {
 		}
 	}
 
-	setupLogging()
+	if bin, err := os.Executable(); err == nil {
+		if err := migrateLegacyLoginItem(legacyLoginItemPath(), loginItemPath(), bin); err != nil {
+			log.Printf("migrate login item: %v", err)
+		}
+	}
 	secret, pairingCode, err := secureconn.LoadOrCreateSecret(pairingFilePath())
 	if err != nil {
 		log.Fatalf("pairing key: %v", err)
@@ -102,13 +121,95 @@ func readFileConfig() (*fileConfig, error) {
 	return &fc, nil
 }
 
+func migrateLegacyData(legacyDir, destinationDir string) error {
+	dirReady := false
+	for _, name := range []string{"pairing.key", "config.json"} {
+		source := filepath.Join(legacyDir, name)
+		data, err := os.ReadFile(source)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !dirReady {
+			if err := os.MkdirAll(destinationDir, 0o700); err != nil {
+				return err
+			}
+			dirReady = true
+		}
+		// O_EXCL never overwrites an existing EdgeHop file and avoids the
+		// stat-then-write race.
+		f, err := os.OpenFile(filepath.Join(destinationDir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func saveRemoteEdge(path, edge string) error {
+	if edge != server.EdgeLeft && edge != server.EdgeRight {
+		return errors.New("invalid remote edge")
+	}
+	var cfg fileConfig
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return err
+		}
+		if cfg.Edge == edge {
+			return nil // no change: skip the rewrite
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	cfg.Edge = edge
+	data, err = json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.json")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
 // onReady runs on the main thread once the tray icon is live.
 func onReady(listen, edge string, switchKeys []int, pairingSecret []byte, pairingCode string) {
 	systray.SetTemplateIcon(menuIcon, menuIcon)
 	systray.SetTooltip(tooltip)
 
-	serverItem := systray.AddMenuItem("服务器: 启动中…", "uc-server 运行状态")
-	clientItem := systray.AddMenuItem("客户端: 未连接", "Omarchy 连接状态")
+	serverItem := systray.AddMenuItem("服务器: 启动中…", "EdgeHop 服务状态")
+	clientItem := systray.AddMenuItem("客户端: 未连接", "Linux 客户端连接状态")
 	modeItem := systray.AddMenuItem("模式: local", "当前控制模式")
 	serverItem.Disable()
 	clientItem.Disable()
@@ -121,7 +222,14 @@ func onReady(listen, edge string, switchKeys []int, pairingSecret []byte, pairin
 	loginItem := systray.AddMenuItemCheckbox("登录时自动启动", "登录后自动运行本应用", loginItemEnabled())
 
 	systray.AddSeparator()
-	quitItem := systray.AddMenuItem("退出", "退出 Universal Control")
+	layoutItem := systray.AddMenuItem("设备布局", "选择客户端位于这台 Mac 的哪一侧")
+	clientLeftItem := layoutItem.AddSubMenuItemCheckbox("客户端在 Mac 左侧", "从 Mac 左边缘切换到客户端", edge == server.EdgeLeft)
+	clientRightItem := layoutItem.AddSubMenuItemCheckbox("客户端在 Mac 右侧", "从 Mac 右边缘切换到客户端", edge == server.EdgeRight)
+
+	systray.AddSeparator()
+	quitItem := systray.AddMenuItem("退出", "退出 EdgeHop")
+
+	edgeUpdates := make(chan string, 1)
 
 	// Action handlers.
 	go func() {
@@ -161,6 +269,40 @@ func onReady(listen, edge string, switchKeys []int, pairingSecret []byte, pairin
 		}
 	}()
 	go func() {
+		current := edge
+		for {
+			var selected string
+			select {
+			case <-clientLeftItem.ClickedCh:
+				selected = server.EdgeLeft
+			case <-clientRightItem.ClickedCh:
+				selected = server.EdgeRight
+			}
+			if selected == current {
+				continue
+			}
+			if err := saveRemoteEdge(configFilePath(), selected); err != nil {
+				log.Printf("save device layout: %v", err)
+				continue
+			}
+			current = selected
+			if selected == server.EdgeLeft {
+				clientLeftItem.Check()
+				clientRightItem.Uncheck()
+			} else {
+				clientLeftItem.Uncheck()
+				clientRightItem.Check()
+			}
+			// Coalesce: keep only the latest pending layout update.
+			select {
+			case edgeUpdates <- selected:
+			default:
+				<-edgeUpdates
+				edgeUpdates <- selected
+			}
+		}
+	}()
+	go func() {
 		<-quitItem.ClickedCh
 		systray.Quit()
 	}()
@@ -169,6 +311,7 @@ func onReady(listen, edge string, switchKeys []int, pairingSecret []byte, pairin
 	cfg := server.DefaultConfig()
 	cfg.ListenAddr = listen
 	cfg.RemoteEdge = edge
+	cfg.RemoteEdgeUpdates = edgeUpdates
 	cfg.PairingSecret = pairingSecret
 	cfg.SwitchKeys = switchKeys
 	go func() {
@@ -219,13 +362,17 @@ func setupLogging() {
 		return
 	}
 	log.SetOutput(io.MultiWriter(f, os.Stderr))
-	log.Printf("=== Universal Control started %s ===", time.Now().Format(time.RFC3339))
+	log.Printf("=== EdgeHop started %s ===", time.Now().Format(time.RFC3339))
 }
 
 // --- login item (LaunchAgent) ---------------------------------------------
 
 func loginItemPath() string {
 	return filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", appLabel+".plist")
+}
+
+func legacyLoginItemPath() string {
+	return filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", legacyAppLabel+".plist")
 }
 
 func loginItemEnabled() bool {
@@ -253,16 +400,36 @@ func enableLoginItem() error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(loginItemPath())
+	return writeLoginItem(loginItemPath(), bin)
+}
+
+func migrateLegacyLoginItem(legacyPath, destinationPath, binary string) error {
+	if _, err := os.Stat(legacyPath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if _, err := os.Stat(destinationPath); os.IsNotExist(err) {
+		if err := writeLoginItem(destinationPath, binary); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	return os.Remove(legacyPath)
+}
+
+func writeLoginItem(path, binary string) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(loginItemPath())
+	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return loginPlistTpl.Execute(f, struct{ Label, Binary string }{appLabel, bin})
+	return loginPlistTpl.Execute(f, struct{ Label, Binary string }{appLabel, binary})
 }
 
 func disableLoginItem() error {
@@ -274,5 +441,5 @@ func disableLoginItem() error {
 }
 
 func onExit() {
-	log.Printf("=== Universal Control exited ===")
+	log.Printf("=== EdgeHop exited ===")
 }

@@ -3,8 +3,8 @@ package client
 import (
 	"errors"
 	"fmt"
+	"github.com/Coraia/EdgeHop/internal/secureconn"
 	"time"
-	"universal_control/internal/secureconn"
 )
 
 // Config configures the Linux client.
@@ -39,7 +39,7 @@ type Config struct {
 // display, Mac on the right).
 func DefaultConfig() Config {
 	return Config{
-		DeviceName:       "universal-control",
+		DeviceName:       "edgehop",
 		Edge:             "right",
 		EdgeMargin:       8.0,
 		ClipInterval:     500 * time.Millisecond,

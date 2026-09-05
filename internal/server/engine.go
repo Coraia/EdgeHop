@@ -2,12 +2,14 @@ package server
 
 import (
 	"bufio"
+	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
-	"universal_control/internal/clipsync"
-	"universal_control/internal/protocol"
+
+	"github.com/Coraia/EdgeHop/internal/clipsync"
+	"github.com/Coraia/EdgeHop/internal/protocol"
 )
 
 // Mode is the current control state.
@@ -40,6 +42,7 @@ type engine struct {
 	cfg     Config
 	mode    atomic.Int32
 	remote  atomic.Bool // fast path: whether we are currently forwarding
+	edge    atomic.Uint32
 	stateMu sync.Mutex
 
 	mu   sync.Mutex
@@ -162,7 +165,40 @@ var setMouseAssoc func(assoc bool)
 
 // remoteEdgeIsRight reports whether the client sits on the Mac's right edge.
 func (e *engine) remoteEdgeIsRight() bool {
-	return e.cfg.RemoteEdge == EdgeRight
+	return protocol.Edge(e.edge.Load()) == protocol.EdgeRight
+}
+
+func (e *engine) clientEdge() protocol.Edge {
+	if e.remoteEdgeIsRight() {
+		return protocol.EdgeLeft
+	}
+	return protocol.EdgeRight
+}
+
+// setRemoteEdge updates the shared seam and tells the client which opposite
+// edge should return control. The Mac remains the single source of truth.
+func (e *engine) setRemoteEdge(edge string) error {
+	parsed, err := protocol.ParseEdge(edge)
+	if err != nil {
+		return errors.New("server: invalid remote edge")
+	}
+	if e.edge.Load() == uint32(parsed) {
+		return nil // no change: skip state reset and client notification
+	}
+
+	e.stateMu.Lock()
+	e.edge.Store(uint32(parsed))
+	e.sticky = false
+	e.stickyPush = 0
+	e.edgeArmed = true
+	if e.onEdgeUI != nil {
+		e.onEdgeUI(false, 0)
+	}
+	e.stateMu.Unlock()
+
+	e.send(protocol.MsgClientEdge, protocol.EncodeClientEdge(e.clientEdge()))
+	log.Printf("device layout updated: client on Mac %s", parsed)
+	return nil
 }
 
 // newEngine builds an engine from config and wires platform functions.
@@ -178,6 +214,11 @@ func newEngine(cfg Config) *engine {
 	for _, k := range cfg.SwitchKeys {
 		e.swKeys[k] = true
 	}
+	edge, err := protocol.ParseEdge(cfg.RemoteEdge)
+	if err != nil {
+		edge = protocol.EdgeRight
+	}
+	e.edge.Store(uint32(edge))
 	e.remote.Store(false)
 	e.edgeArmed = true // initial state: first edge crossing may enter remote
 	return e

@@ -10,6 +10,9 @@ export UC_SKIP_SYSTEM_COMMANDS=1
 export HOME="$TMP/home"
 export USER="testuser"
 mkdir -p "$HOME/.config/hypr"
+mkdir -p "$UC_INSTALL_ROOT/etc/systemd/system" "$UC_INSTALL_ROOT/usr/local/bin"
+printf 'legacy service\n' > "$UC_INSTALL_ROOT/etc/systemd/system/uc-client.service"
+printf 'legacy binary\n' > "$UC_INSTALL_ROOT/usr/local/bin/uc-client"
 cat > "$HOME/.config/hypr/hyprland.conf" <<'EOF'
 # --- universal-control: 虚拟指针去加速 ---
 input-device {
@@ -28,16 +31,19 @@ printf '%s\n' "$PAIRING_CODE" | "$ROOT/scripts/setup-omarchy.sh" \
   -s 192.0.2.10 \
   -b "$BIN"
 
-SERVICE="$UC_INSTALL_ROOT/etc/systemd/system/uc-client.service"
-KEY="$HOME/.config/universal-control/pairing.key"
+SERVICE="$UC_INSTALL_ROOT/etc/systemd/system/edgehop-client.service"
+KEY="$HOME/.config/edgehop/pairing.key"
 HYPR="$HOME/.config/hypr/hyprland.conf"
 
 grep -Fq -- "-server 192.0.2.10:24800" "$SERVICE"
-grep -Fq -- "-pairing-file $HOME/.config/universal-control/pairing.key" "$SERVICE"
+grep -Fq -- "-pairing-file $HOME/.config/edgehop/pairing.key" "$SERVICE"
 if grep -Fq -- "-pairing-file %h/" "$SERVICE"; then
   echo "system service must not use manager-relative %h for the pairing key" >&2
   exit 1
 fi
+[ -x "$UC_INSTALL_ROOT/usr/local/bin/edgehop-client" ]
+[ ! -e "$UC_INSTALL_ROOT/etc/systemd/system/uc-client.service" ]
+[ ! -e "$UC_INSTALL_ROOT/usr/local/bin/uc-client" ]
 [ "$(cat "$KEY")" = "$PAIRING_CODE" ]
 if stat -f '%Lp' "$KEY" >/dev/null 2>&1; then
   KEY_MODE="$(stat -f '%Lp' "$KEY")"
@@ -46,6 +52,11 @@ else
 fi
 [ "$KEY_MODE" = "600" ]
 grep -Fq "device {" "$HYPR"
+grep -Fq "name = edgehop" "$HYPR"
+if grep -Fq "universal-control" "$HYPR"; then
+  echo "legacy device name remains" >&2
+  exit 1
+fi
 if grep -Fq "input-device {" "$HYPR"; then
   echo "invalid input-device block remains" >&2
   exit 1

@@ -14,8 +14,8 @@ func TestUinputSetupSizes(t *testing.T) {
 	}
 	// name must land at offset 8 so the kernel sees a non-empty name.
 	var s uinputSetup
-	copy(s.Name[:], "universal-control")
-	if s.Name[0] != 'u' {
+	copy(s.Name[:], "edgehop")
+	if s.Name[0] != 'e' {
 		t.Error("modern layout name offset wrong")
 	}
 }

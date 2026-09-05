@@ -1,6 +1,6 @@
-// uc-server runs on the Mac mini (the machine with the physical trackpad and
-// keyboard). It captures global input via CGEventTap, forwards it to the
-// uc-client on the Omarchy machine over TCP, and synchronizes the clipboard.
+// edgehop-server runs on the Mac with the physical trackpad and keyboard. It
+// captures global input via CGEventTap, forwards it to the Linux client, and
+// synchronizes the clipboard.
 //
 // Permissions required (System Settings > Privacy & Security):
 //   - Accessibility: needed for the event tap and synthetic events.
@@ -8,20 +8,20 @@ package main
 
 import (
 	"flag"
+	"github.com/Coraia/EdgeHop/internal/secureconn"
+	"github.com/Coraia/EdgeHop/internal/server"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-	"universal_control/internal/secureconn"
-	"universal_control/internal/server"
 )
 
 func main() {
 	var (
 		listen       = flag.String("listen", "0.0.0.0:24800", "TCP listen address")
-		pairingFile  = flag.String("pairing-file", filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "universal-control", "pairing.key"), "shared pairing key file")
+		pairingFile  = flag.String("pairing-file", filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "edgehop", "pairing.key"), "shared pairing key file")
 		edge         = flag.String("edge", "right", "which edge of the Mac screen touches the client: right or left")
 		swKeysRaw    = flag.String("switch-keys", "", "comma-separated macOS keycodes for a hotkey that toggles remote mode (e.g. 55,56,49)")
 		sensitivity  = flag.Float64("edge-sensitivity", 2.0, "edge margin in points that triggers switching")
@@ -50,7 +50,7 @@ func main() {
 		}
 	}
 
-	log.Printf("uc-server starting: listen=%s edge=%s", cfg.ListenAddr, cfg.RemoteEdge)
+	log.Printf("EdgeHop server starting: listen=%s edge=%s", cfg.ListenAddr, cfg.RemoteEdge)
 	if err := server.Run(cfg); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}

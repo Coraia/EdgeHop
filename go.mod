@@ -1,4 +1,4 @@
-module universal_control
+module github.com/Coraia/EdgeHop
 
 go 1.26
 
