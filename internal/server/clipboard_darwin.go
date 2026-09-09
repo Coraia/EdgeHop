@@ -3,28 +3,22 @@
 package server
 
 import (
-	"github.com/Coraia/EdgeHop/internal/protocol"
 	"log"
-	"os/exec"
-	"strings"
 	"time"
+
+	"github.com/Coraia/EdgeHop/internal/macclipboard"
+	"github.com/Coraia/EdgeHop/internal/protocol"
 )
 
 // readClipboard returns the current text on the macOS clipboard.
 // ok=false when the clipboard is empty or unreadable.
 func readClipboard() (string, bool) {
-	out, err := exec.Command("/usr/bin/pbpaste").Output()
-	if err != nil {
-		return "", false
-	}
-	return string(out), true
+	return macclipboard.Read()
 }
 
 // writeClipboard replaces the macOS clipboard with text.
 func writeClipboard(text string) {
-	cmd := exec.Command("/usr/bin/pbcopy")
-	cmd.Stdin = strings.NewReader(text)
-	if err := cmd.Run(); err != nil {
+	if err := macclipboard.Write(text); err != nil {
 		log.Printf("warn: pbcopy failed: %v", err)
 	}
 }

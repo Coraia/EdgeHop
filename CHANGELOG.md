@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Clipboard text with multi-byte UTF-8 characters (e.g. Chinese) no longer
+  arrives as mojibake on either side. GUI-launched macOS apps inherit no
+  `LANG`/`LC_*` environment, which made `pbcopy`/`pbpaste` fall back to the
+  legacy MacRoman encoding; all clipboard commands now run with an explicit
+  UTF-8 locale.
+
 ## [0.3.0] - 2026-09-05
 
 ### Added

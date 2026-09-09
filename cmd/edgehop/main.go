@@ -17,10 +17,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"text/template"
 	"time"
 
+	"github.com/Coraia/EdgeHop/internal/macclipboard"
 	"github.com/Coraia/EdgeHop/internal/secureconn"
 	"github.com/Coraia/EdgeHop/internal/server"
 	"github.com/getlantern/systray"
@@ -244,9 +244,7 @@ func onReady(listen, edge string, switchKeys []int, pairingSecret []byte, pairin
 	}()
 	go func() {
 		for range copyPairingItem.ClickedCh {
-			cmd := exec.Command("/usr/bin/pbcopy")
-			cmd.Stdin = strings.NewReader(pairingCode)
-			if err := cmd.Run(); err != nil {
+			if err := macclipboard.Write(pairingCode); err != nil {
 				log.Printf("copy pairing code: %v", err)
 			}
 		}
