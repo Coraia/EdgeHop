@@ -39,11 +39,12 @@ const (
 // to suppress the event. Network sends are enqueued to sendQ and drained by a
 // separate writer goroutine, so a slow client never blocks the tap.
 type engine struct {
-	cfg     Config
-	mode    atomic.Int32
-	remote  atomic.Bool // fast path: whether we are currently forwarding
-	edge    atomic.Uint32
-	stateMu sync.Mutex
+	cfg          Config
+	mode         atomic.Int32
+	remote       atomic.Bool // fast path: whether we are currently forwarding
+	edge         atomic.Uint32
+	stateMu      sync.Mutex
+	inputBlocked string // guarded by stateMu; empty means sharing is available
 
 	mu   sync.Mutex
 	conn netConn // current client connection writer (nil if disconnected)
@@ -105,6 +106,7 @@ type Status struct {
 	ClientConnected bool
 	Mode            string // "local" | "remote"
 	LastError       string
+	InputBlocked    string // "mac_locked" | "secure_input" | "session_unavailable" | ""
 }
 
 type netConn interface {
@@ -162,6 +164,57 @@ var warpOffscreen func(x, y float64)
 // mouse with the cursor position. While disassociated the cursor never tracks
 // the mouse, no matter the event tap level. Overridable in tests.
 var setMouseAssoc func(assoc bool)
+
+// inputBlockReason reads macOS session/security state without capturing input.
+var inputBlockReason func() string
+
+// Query WindowServer outside the input callback and outside stateMu. A
+// synchronous session query from a HID callback can wait for WindowServer,
+// which is itself waiting for that callback to return.
+func (e *engine) refreshInputGuard() {
+	if inputBlockReason == nil {
+		return
+	}
+	reason := inputBlockReason()
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.applyInputGuardLocked(reason)
+}
+
+// applyInputGuardLocked keeps both devices in local mode when macOS cannot
+// provide complete keyboard and mouse capture. Caller holds stateMu.
+func (e *engine) applyInputGuardLocked(reason string) {
+	if reason == e.inputBlocked {
+		return
+	}
+	e.inputBlocked = reason
+	e.sticky = false
+	e.stickyPush = 0
+	e.pendingRemote = false
+	e.hotkeyLocked = false
+	clear(e.keysDown)
+	clear(e.buttonsDown)
+	e.edgeArmed = false // require a fresh edge crossing after recovery
+	if e.onEdgeUI != nil {
+		e.onEdgeUI(false, 0)
+	}
+	e.updateStatus(func(s *Status) { s.InputBlocked = reason })
+	if reason != "" {
+		e.leaveRemoteLocked(-1)
+		log.Printf("input sharing paused: %s (control stays on Mac)", reason)
+	} else {
+		log.Printf("input sharing available (move away from shared edge before switching)")
+	}
+}
+
+// Poll even when secure input prevents keyboard events from reaching the tap.
+func (e *engine) inputGuardLoop() {
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for range t.C {
+		e.refreshInputGuard()
+	}
+}
 
 // remoteEdgeIsRight reports whether the client sits on the Mac's right edge.
 func (e *engine) remoteEdgeIsRight() bool {
@@ -351,6 +404,7 @@ func modeName(m Mode) string {
 // run starts background services. It is called once after the tap is up.
 func (e *engine) run() {
 	go e.writer()
+	go e.inputGuardLoop()
 
 	e.refreshScreen()
 	go e.screenLoop()
@@ -376,6 +430,10 @@ func (e *engine) stickyDwellLoop() {
 	defer t.Stop()
 	for range t.C {
 		e.stateMu.Lock()
+		if e.inputBlocked != "" {
+			e.stateMu.Unlock()
+			continue
+		}
 		if e.isRemote() || !e.sticky {
 			e.stateMu.Unlock()
 			continue
@@ -431,14 +489,19 @@ func stickyBarLen(c float64) float64 {
 // consume is the tap callback adapter. It MUST return the final decision:
 // true = consume (suppress locally), false = pass through to the Mac.
 func (e *engine) consume(ev rawEvent) bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	if e.inputBlocked != "" {
+		return false // password/lock-screen input remains exclusively local
+	}
 	if !e.clientConnected() {
 		return false
 	}
 	if e.isRemote() {
-		e.forwardRemote(ev)
+		e.forwardRemoteLocked(ev)
 		return true
 	}
-	return e.watchLocal(ev)
+	return e.watchLocalLocked(ev)
 }
 
 // watchLocal: input applies to the Mac; watch for edge/hotkey switches.
@@ -446,6 +509,10 @@ func (e *engine) consume(ev rawEvent) bool {
 func (e *engine) watchLocal(ev rawEvent) bool {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
+	return e.watchLocalLocked(ev)
+}
+
+func (e *engine) watchLocalLocked(ev rawEvent) bool {
 
 	// Track held keys for hotkey detection.
 	switch ev.ctype {
@@ -566,6 +633,10 @@ func (e *engine) finishPendingRemote() bool {
 func (e *engine) forwardRemote(ev rawEvent) {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
+	e.forwardRemoteLocked(ev)
+}
+
+func (e *engine) forwardRemoteLocked(ev rawEvent) {
 
 	// Hotkey while remote returns control to the Mac. We check it only on
 	// press events (not on key-up), and only after recording the press, so that
@@ -658,6 +729,9 @@ func (e *engine) enterRemote() {
 }
 
 func (e *engine) enterRemoteLocked() {
+	if e.inputBlocked != "" {
+		return
+	}
 	if e.isRemote() {
 		return
 	}

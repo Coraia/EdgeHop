@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Return shared input to the Mac and pause cross-screen switching while the
+  Mac is locked, secure keyboard input is enabled, or the console session is
+  unavailable. Clear pending switches, release client input, show the pause
+  reason in the menu bar, and require a fresh crossing after recovery.
 - Clipboard text with multi-byte UTF-8 characters (e.g. Chinese) no longer
   arrives as mojibake on either side. GUI-launched macOS apps inherit no
   `LANG`/`LC_*` environment, which made `pbcopy`/`pbpaste` fall back to the

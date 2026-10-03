@@ -334,9 +334,25 @@ func updateStatus(serverItem, clientItem, modeItem *systray.MenuItem, s server.S
 		clientItem.SetTitle("客户端: 未连接")
 	}
 	modeItem.SetTitle("模式: " + s.Mode)
-	if s.LastError != "" {
+	if s.InputBlocked != "" {
+		reason := "Mac 会话不可用"
+		switch s.InputBlocked {
+		case "mac_locked":
+			reason = "Mac 已锁屏"
+		case "secure_input":
+			reason = "安全键盘输入已开启"
+		}
+		modeItem.SetTitle("跨屏暂停: " + reason)
+		modeItem.SetTooltip("键鼠留在 Mac；解除限制后，移开共享边缘再跨屏即可恢复")
+		systray.SetTitle("⚠")
+		systray.SetTooltip("EdgeHop — 跨屏暂停: " + reason)
+	} else if s.LastError != "" {
+		systray.SetTitle("")
+		systray.SetTooltip(tooltip)
 		modeItem.SetTooltip(s.LastError)
 	} else {
+		systray.SetTitle("")
+		systray.SetTooltip(tooltip)
 		modeItem.SetTooltip("当前控制模式")
 	}
 }

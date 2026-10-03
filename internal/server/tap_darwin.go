@@ -349,6 +349,7 @@ func isAccessibilityTrusted() bool {
 
 // initDisplay wires the platform display functions used by the engine.
 func initDisplay() {
+	inputBlockReason = platformInputBlockReason
 	screen = func() screenSize {
 		var w, h C.int
 		C.screenSize(&w, &h)

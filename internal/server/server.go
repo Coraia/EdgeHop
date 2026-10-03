@@ -37,6 +37,7 @@ func RunWithStatus(cfg Config, onStatus func(Status)) error {
 	if onStatus != nil {
 		e.setOnStatus(onStatus)
 	}
+	e.refreshInputGuard()
 
 	// Event tap on a dedicated goroutine with retry (never exits the process).
 	// While Accessibility permission is missing we wait quietly instead of
@@ -151,12 +152,14 @@ func (e *engine) handleConn(c net.Conn) {
 	// Re-sync control mode to the new client: if we are already in remote mode
 	// (e.g. the client reconnected while we were controlling Omarchy), tell it
 	// so its edge-watch / input path starts correctly.
+	e.stateMu.Lock()
 	if e.isRemote() {
-		_ = cc.Send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
+		e.send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
 			Direction: protocol.SwitchRemote,
 		}))
 		log.Printf("re-synced remote mode to reconnected client")
 	}
+	e.stateMu.Unlock()
 	e.recvLoop(r)
 
 	e.dropConn(cc)
