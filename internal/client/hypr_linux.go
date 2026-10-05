@@ -3,10 +3,12 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // hyprScreenSize returns the LOGICAL size of the first monitor via "hyprctl
@@ -29,6 +31,32 @@ func hyprScreenSize() (w, h int, err error) {
 	return parseMonitorSize(string(out))
 }
 
+// hyprMoveCursorAbs parks once, without feeding accelerated relative moves
+// back into uinput. Both dispatcher syntaxes share a bounded deadline.
+func hyprMoveCursorAbs(x, y float64) error {
+	if !ensureHyprEnv() {
+		return fmt.Errorf("no Hyprland instance available")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	commands := [][]string{
+		{"dispatch", fmt.Sprintf("hl.dsp.cursor.move({ x = %.0f, y = %.0f })", x, y)},
+		{"dispatch", "movecursor", fmt.Sprintf("%.0f %.0f", x, y)},
+	}
+	var lastErr error
+	for _, args := range commands {
+		out, err := exec.CommandContext(ctx, "hyprctl", args...).CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) == "ok" {
+			return nil
+		}
+		lastErr = fmt.Errorf("hyprctl cursor move: %v (%s)", err, strings.TrimSpace(string(out)))
+		if ctx.Err() != nil {
+			return fmt.Errorf("hyprctl cursor move: %w", ctx.Err())
+		}
+	}
+	return lastErr
+}
+
 // hyprCursorPos returns the current cursor position in Omarchy screen
 // coordinates by asking Hyprland's IPC ("hyprctl cursorpos" -> "x, y").
 // These coordinates are in the same logical space as hyprScreenSize.
@@ -36,7 +64,9 @@ func hyprCursorPos() (x, y float64, err error) {
 	if !ensureHyprEnv() {
 		return 0, 0, fmt.Errorf("no Hyprland instance available")
 	}
-	out, err := exec.Command("hyprctl", "cursorpos").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "hyprctl", "cursorpos").Output()
 	if err != nil {
 		return 0, 0, fmt.Errorf("hyprctl cursorpos: %w", err)
 	}

@@ -25,6 +25,7 @@ type Client struct {
 	auth       *secureconn.Authenticator
 	screenSize func() (int, int, error)
 	remote     atomic.Bool
+	session    atomic.Uint64 // invalidates edge watchers from earlier remote sessions
 	edge       atomic.Uint32
 	inputMu    sync.Mutex
 
@@ -292,27 +293,37 @@ func (c *Client) handleSwitch(message protocol.Switch) {
 // edgeY is the Mac-side Y where the cursor crossed (proportionally mapped onto
 // this screen), or -1 to keep the current Y.
 func (c *Client) enterRemote(edgeY float64) {
-	if c.remote.Swap(true) {
+	c.inputMu.Lock()
+	defer c.inputMu.Unlock()
+	if c.remote.Load() {
 		return
 	}
-	log.Printf("remote control: Mac -> Omarchy")
 	// Park the virtual cursor just inside the shared edge. When the Mac told us
 	// where its cursor crossed (edgeY), land at the same Y (proportionally
 	// mapped) so the crossing feels like a seamless slide; otherwise keep the
-	// current Y. Then begin edge watching.
-	go func() {
-		x, y, err := hyprCursorPos()
-		if err != nil {
-			log.Printf("warn: park: cursorpos failed: %v", err)
-			return
+	// current Y. Complete this once before accepting incoming input: a
+	// background relative-move loop would fight every incoming trackpad move.
+	y := c.mapMacY(edgeY)
+	var err error
+	if edgeY < 0 {
+		_, y, err = hyprCursorPos()
+	}
+	if err == nil {
+		_, scrH, _, _ := c.screenGeometry()
+		if scrH > 0 {
+			y = clamp(y, 0, scrH-1)
 		}
-		if edgeY >= 0 {
-			y = c.mapMacY(edgeY)
-		}
-		c.moveCursorAbs(c.parkX(), y)
-		log.Printf("parked cursor at x=%.0f y=%.0f (was x=%.0f)", c.parkX(), y, x)
-	}()
-	go c.edgeWatch()
+		err = hyprMoveCursorAbs(c.parkX(), y)
+	}
+	if err != nil {
+		log.Printf("warn: park: %v (continuing without cursor correction)", err)
+	} else {
+		log.Printf("parked cursor at x=%.0f y=%.0f", c.parkX(), y)
+	}
+	session := c.session.Add(1)
+	c.remote.Store(true)
+	log.Printf("remote control: Mac -> Omarchy")
+	go c.edgeWatch(session)
 }
 
 // mapMacY maps a Mac-side Y onto this screen's height by proportion.
@@ -338,16 +349,22 @@ func (c *Client) parkX() float64 {
 
 // leaveRemote stops edge watching.
 func (c *Client) leaveRemote() {
+	c.inputMu.Lock()
+	defer c.inputMu.Unlock()
+	c.leaveRemoteLocked()
+}
+
+// Caller holds inputMu so entry, exit and input injection stay ordered.
+func (c *Client) leaveRemoteLocked() {
 	if !c.remote.Swap(false) {
 		return
 	}
+	c.session.Add(1)
 	log.Printf("remote control: returned to Mac")
 	// Release every key and mouse button that may still be held down on the
 	// client. Without this, a hotkey (e.g. Cmd+Shift+Space) pressed to return
 	// could leave modifiers stuck on Omarchy.
-	c.inputMu.Lock()
 	c.releaseAll()
-	c.inputMu.Unlock()
 }
 
 // releaseAll sends key-up for every possible keycode and releases every mouse
@@ -375,7 +392,7 @@ func (c *Client) releaseAll() {
 // A dwell is required (not a single poll) so that simply passing through the
 // edge zone — e.g. the cursor being parked near the edge when remote control
 // starts — does not bounce control back immediately.
-func (c *Client) edgeWatch() {
+func (c *Client) edgeWatch(session uint64) {
 	// Give enterRemote's parking a moment to move the cursor inside the shared
 	// edge, so a cursor already sitting at the edge (e.g. from the previous
 	// remote session) does not immediately bounce control back.
@@ -385,10 +402,13 @@ func (c *Client) edgeWatch() {
 	defer t.Stop()
 	var inZoneSince time.Time
 	for range t.C {
-		if !c.remote.Load() || !c.connected() {
+		if !c.remote.Load() || c.session.Load() != session || !c.connected() {
 			return
 		}
 		x, _, err := hyprCursorPos()
+		if c.session.Load() != session || !c.remote.Load() {
+			return
+		}
 		if err != nil {
 			continue
 		}
@@ -408,6 +428,11 @@ func (c *Client) edgeWatch() {
 				// Tell the server where we crossed so the Mac cursor lands at
 				// the same Y (proportionally) instead of a fixed park point.
 				_, y, errY := hyprCursorPos()
+				c.inputMu.Lock()
+				if c.session.Load() != session || !c.remote.Load() {
+					c.inputMu.Unlock()
+					return
+				}
 				if errY != nil {
 					c.send(protocol.MsgSwitch, protocol.EncodeSwitch(protocol.Switch{
 						Direction: protocol.SwitchBack,
@@ -419,7 +444,8 @@ func (c *Client) edgeWatch() {
 						HasY:      true,
 					}))
 				}
-				c.leaveRemote()
+				c.leaveRemoteLocked()
+				c.inputMu.Unlock()
 				return
 			}
 		} else {
@@ -470,33 +496,6 @@ func (c *Client) screenGeometry() (scrW, scrH, macW, macH float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.scrW, c.scrH, c.macW, c.macH
-}
-
-// moveCursorAbs nudges the virtual cursor to (x, y) using a feedback loop,
-// because uinput relative moves are subject to pointer acceleration.
-func (c *Client) moveCursorAbs(x, y float64) {
-	for i := 0; i < 40; i++ {
-		cx, cy, err := hyprCursorPos()
-		if err != nil {
-			return
-		}
-		dx := int16(clamp(float64(x)-cx, -200, 200))
-		dy := int16(clamp(float64(y)-cy, -200, 200))
-		if dx == 0 && dy == 0 {
-			return
-		}
-		c.inputMu.Lock()
-		if !c.remote.Load() {
-			c.inputMu.Unlock()
-			return
-		}
-		if err := c.dev.MouseMoveRel(dx, dy); err != nil {
-			c.inputMu.Unlock()
-			return
-		}
-		c.inputMu.Unlock()
-		time.Sleep(15 * time.Millisecond)
-	}
 }
 
 func clamp(v, lo, hi float64) float64 {
